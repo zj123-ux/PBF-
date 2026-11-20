@@ -188,7 +188,9 @@ def check_form_config(form_id: str, cfg: dict) -> list[Issue]:
         issues.append(_warn(f"{form_id}: 配置内 form_id={cfg['form_id']!r} 与文件名不一致"))
 
     rows = cfg.get("input_rows")
-    if not (isinstance(rows, list) and len(rows) == 2 and rows[0] <= rows[1]):
+    if not (isinstance(rows, list) and len(rows) == 2
+            and all(isinstance(r, int) and not isinstance(r, bool) for r in rows)
+            and rows[0] <= rows[1]):
         issues.append(_err(f"{form_id}: input_rows 应为 [起始行, 结束行] 且起始<=结束"))
 
     periods = configured_periods(cfg)
@@ -232,6 +234,27 @@ def check_form_config(form_id: str, cfg: dict) -> list[Issue]:
 
 # ---------- 全局 ----------
 
+def resolve_from_step(flow_cfg: dict, raw: object) -> int:
+    """把 `--from-step` 的原始值（1 起序号或表单 ID）解析成 1 起的步骤序号。
+
+    argparse 不限制类型（既可能是 "4" 也可能是表单 ID），而 check_flow 按
+    数字比较，必须在进入校验前统一解析；None/空表示从头开始。
+    """
+    steps = flow_cfg.get("steps") or []
+    key = str(raw).strip() if raw not in (None, "") else ""
+    if not key:
+        return 1
+    if key.isdigit():
+        idx = int(key)
+        if not 1 <= idx <= len(steps):
+            raise ValueError(f"--from-step {key} 超出范围（共 {len(steps)} 步）")
+        return idx
+    names = [str(step.get("form", "")) for step in steps]
+    if key not in names:
+        raise ValueError(f"--from-step 未找到表单 '{key}'，可选：{names}")
+    return names.index(key) + 1
+
+
 def check_flow(flow_cfg: dict, form_cfgs: dict[str, dict], data_dir: Path,
                check_data: bool = True, from_step: int = 1) -> list[Issue]:
     """校验 flow.yaml + 各步骤表单/数据文件。
@@ -240,6 +263,14 @@ def check_flow(flow_cfg: dict, form_cfgs: dict[str, dict], data_dir: Path,
     其数据文件校验一并跳过（"只跑后半段"的断点续跑不再被前置文件拦截）。
     """
     issues: list[Issue] = []
+
+    # 直接传字符串（CLI 原始值）时也按序号/表单 ID 解析，避免 int >= str
+    if isinstance(from_step, str):
+        try:
+            from_step = resolve_from_step(flow_cfg, from_step)
+        except ValueError as exc:
+            issues.append(_err(str(exc)))
+            from_step = 1
 
     nav = flow_cfg.get("navigator") or {}
     source = str(nav.get("source") or "bw").lower()

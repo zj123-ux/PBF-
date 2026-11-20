@@ -42,7 +42,8 @@ from engine import (ExcelEngine, ExcelError, FormWriter, Navigator, RunPackageRu
 from engine.business_units import (UnitError, apply_unit, check_units,
                                    csv_dimension_warnings, default_unit)
 from engine.clear import clear_data
-from engine.config_check import Issue, check_flow, check_form_config
+from engine.config_check import (Issue, check_flow, check_form_config,
+                                 resolve_from_step)
 from engine.periods import parse_periods
 from engine.template_export import export_template
 from data_dirs import (latest_data_dir as find_latest_data_dir,
@@ -616,16 +617,24 @@ def cmd_run_flow(args) -> None:
           f" | 仅核对: {args.only_verify}"
           + (f" | 从步骤 {args.from_step} 开始" if args.from_step else "") + "\n")
 
+    # --from-step 既接受序号也接受表单 ID；校验按数字比较，先统一解析
+    raw_from_step = getattr(args, "from_step", None)
+    try:
+        from_step = resolve_from_step(flow_cfg, raw_from_step)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
     # 先做离线校验：配置/数据有问题时不要启动 Excel、更不要跑到一半才失败
     validate_before_run(flow_cfg, form_cfgs, data_dir,
                         check_data=not (args.skip_fill or args.only_verify),
-                        from_step=args.from_step or 1)
+                        from_step=from_step)
 
     engine = ensure_excel_ready(flow_cfg)
 
     report = run_flow(engine, flow_cfg, form_cfgs, data_dir,
                       skip_fill=args.skip_fill, only_verify=args.only_verify,
-                      expected_version=args.version, from_step=args.from_step,
+                      expected_version=args.version,
+                      from_step=from_step if raw_from_step else None,
                       preflight_only=preflight_only,
                       switch_version_key=getattr(args, "version_key", None))
     if unit_name:

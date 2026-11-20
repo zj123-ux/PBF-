@@ -92,6 +92,39 @@ class FormConfigTest(unittest.TestCase):
         issues = cc.check_form_config("F1", cfg)
         self.assertIn("列号重复", messages(issues))
 
+    def test_input_rows_none_reports_error_instead_of_raising(self):
+        # YAML 写成 [3, null] 时应返回可读错误，而不是 TypeError
+        issues = cc.check_form_config("F1", dict(KEYED, input_rows=[3, None]))
+        self.assertIn("input_rows", messages(issues))
+        self.assertIn("error", levels(issues))
+
+    def test_input_rows_mixed_types_reports_error(self):
+        issues = cc.check_form_config("F1", dict(KEYED, input_rows=[44, "61"]))
+        self.assertIn("input_rows", messages(issues))
+
+
+class ResolveFromStepTest(unittest.TestCase):
+    FLOW = {"steps": [{"form": "A"}, {"form": "B"}, {"form": "C"}]}
+
+    def test_none_means_first(self):
+        self.assertEqual(cc.resolve_from_step(self.FLOW, None), 1)
+        self.assertEqual(cc.resolve_from_step(self.FLOW, ""), 1)
+
+    def test_numeric_string(self):
+        self.assertEqual(cc.resolve_from_step(self.FLOW, "3"), 3)
+        self.assertEqual(cc.resolve_from_step(self.FLOW, 2), 2)
+
+    def test_form_id(self):
+        self.assertEqual(cc.resolve_from_step(self.FLOW, "B"), 2)
+
+    def test_out_of_range(self):
+        with self.assertRaisesRegex(ValueError, "超出范围"):
+            cc.resolve_from_step(self.FLOW, "4")
+
+    def test_unknown_form(self):
+        with self.assertRaisesRegex(ValueError, "未找到表单"):
+            cc.resolve_from_step(self.FLOW, "X")
+
 
 class DataFileTest(unittest.TestCase):
     def setUp(self):
@@ -247,6 +280,18 @@ class FlowTest(unittest.TestCase):
                                from_step=2)
         self.assertNotIn("nope.csv", messages(issues))
         self.assertNotIn("error", levels(issues), messages(issues))
+
+    def test_from_step_accepts_cli_string(self):
+        # argparse 给的是字符串；check_flow 不能因此抛 int >= str 的 TypeError
+        flow = dict(self.flow, steps=[
+            {"form": "F1", "nav_cell": "AC57", "data": "nope.csv"},
+            {"form": "F2", "nav_cell": "AC65", "data": "F2.csv"},
+        ])
+        (self.data_dir / "F2.csv").write_text(
+            "组织,产品,期间,单价,销量\nA,X,2027.03,1,2\n", encoding="utf-8-sig")
+        issues = cc.check_flow(flow, {"F1": KEYED, "F2": MEASURES}, self.data_dir,
+                               from_step="2")
+        self.assertNotIn("nope.csv", messages(issues))
 
 
 if __name__ == "__main__":
