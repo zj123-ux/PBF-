@@ -18,21 +18,28 @@ _DATA_DIR_RE = re.compile(r"^data_(\d{4}\.\d{2})(?:_(\d{4}\.\d{2}))?$")
 _PERIOD_RE = re.compile(r"^(\d{4})\.(\d{2})$")
 
 
+def _valid_period(period: str) -> bool:
+    """月份必须在 01–12；data_2027.13 这类目录不能当数据源。"""
+    m = _PERIOD_RE.match(period or "")
+    return bool(m) and 1 <= int(m.group(2)) <= 12
+
+
 def _period_index(period: str) -> int:
     """'2027.03' → 月序号（便于比较先后）。与 engine.periods.period_index 等价，
     这里独立实现是为了让本模块不依赖 engine 包（测试环境无需 pywin32）。"""
     m = _PERIOD_RE.match(period or "")
-    if not m:
+    if not m or not _valid_period(period):
         raise ValueError(f"非法期间: {period!r}")
     return int(m.group(1)) * 12 + int(m.group(2)) - 1
 
 
 def data_dir_periods(name: str) -> list[str]:
-    """目录名 → 期间列表；不是数据目录名时返回空列表。"""
+    """目录名 → 期间列表；不是数据目录名或月份非法时返回空列表。"""
     m = _DATA_DIR_RE.match(name)
     if not m:
         return []
-    return [p for p in m.groups() if p]
+    periods = [p for p in m.groups() if p]
+    return periods if all(_valid_period(p) for p in periods) else []
 
 
 def data_dir_target_period(name: str) -> str | None:

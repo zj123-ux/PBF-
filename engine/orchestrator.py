@@ -645,8 +645,13 @@ class PbfFlow:
                 continue
             if v is None:
                 continue
-            # AO 表头可能是文本 / 数字 / 日期，统一归一化后再匹配
-            key, new_prev = normalize_period_header(v, prev)
+            # AO 表头可能是文本 / 数字 / 日期，统一归一化后再匹配。
+            # 单个异常单元格（NaN/inf、异常公式）不能让整轮核对中断。
+            try:
+                key, new_prev = normalize_period_header(v, prev)
+            except Exception as exc:
+                log.warning(f"表头 {letter}{header_row}={v!r} 解析失败，已跳过: {exc}")
+                continue
             if new_prev != prev:
                 prev = new_prev
             if key and key not in found:

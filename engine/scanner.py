@@ -17,6 +17,7 @@ from typing import Any
 
 from .excel import ExcelEngine
 from .header_periods import MONTH_STR as _MONTH_STR
+from .header_periods import _ambiguous_month
 from .header_periods import month_candidate as _month_candidate
 
 
@@ -72,20 +73,22 @@ class FormScanner:
         """返回 (表头行号(1-based), {期间: 列字母})。选期间数最多的行。"""
         best_row, best_map = 0, {}
         for i, row in enumerate(block, start=1):
-            raw: list[tuple[int, int, int]] = []
+            raw: list[tuple[int, Any, int, int]] = []
             for j, v in enumerate(row, start=1):
                 cand = _month_candidate(v)
                 if cand:
-                    raw.append((j, cand[0], cand[1]))
+                    raw.append((j, v, cand[0], cand[1]))
             if len(raw) < 3:
                 continue
             # 1 月与 10 月存在浮点歧义（2026.1 可能是 1 月或 10 月），
             # 用"期间必须递增"消除：若按 1 月会倒退，则判为 10 月。
+            # 与 header_periods 保持一致：只对两义表示消歧，零填充的
+            # "2027.01"、日期这类明确写法不能被改判。
             resolved: dict[str, str] = {}
             prev = (0, 0)
-            for col, y, m in raw:
+            for col, v, y, m in raw:
                 chosen = m
-                if m == 1 and (y, 1) <= prev:
+                if m == 1 and (y, 1) <= prev and _ambiguous_month(v):
                     chosen = 10
                 resolved[f"{y}.{chosen:02d}"] = col_letter(col)
                 prev = (y, chosen)

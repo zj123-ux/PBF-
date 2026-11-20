@@ -53,6 +53,14 @@ class NormalizePeriodHeaderTest(unittest.TestCase):
     def test_none(self):
         self.assertEqual(hp.normalize_period_header(None), ("", None))
 
+    def test_nan_and_inf_do_not_raise(self):
+        # Excel 异常公式可能返回 NaN/inf：不能被 int() 抛错中断整轮核对
+        for value in (float("nan"), float("inf"), float("-inf")):
+            self.assertIsNone(hp.month_candidate(value))
+            key, prev = hp.normalize_period_header(value, (2027, 6))
+            self.assertEqual(prev, (2027, 6))
+            self.assertEqual(key, str(value).strip())
+
     def test_empty_keeps_prev(self):
         self.assertEqual(hp.normalize_period_header("", (2027, 1)), ("", (2027, 1)))
 

@@ -5,6 +5,7 @@ AO 表头单元格可能是文本（"2027.03"）、数字（2027.03）、日期�
 """
 from __future__ import annotations
 
+import math
 import re
 from datetime import date, datetime
 from typing import Any
@@ -23,6 +24,9 @@ def month_candidate(v: Any) -> tuple[int, int] | None:
         return None
     if isinstance(v, (int, float)):
         f = float(v)
+        # NaN/inf（公式异常、加载中的单元格）不能 int()，直接视为非期间
+        if not math.isfinite(f):
+            return None
         # 纯年份整数（如 2027）不是期间
         if f == int(f) and 1900 < f < 2100:
             return None

@@ -58,6 +58,17 @@ class DataDirTests(unittest.TestCase):
         self._mkdir("data_2027.01_2027.04_clear", "logs")
         self.assertIsNone(latest_data_dir(self.root))
 
+    def test_invalid_month_dirs_are_ignored(self) -> None:
+        # 月份必须 01–12：data_2027.13 / data_2027.00 不能当数据源
+        self._mkdir("data_2027.11", "data_2027.13", "data_2027.00",
+                    "data_2027.11_2027.13")
+        self.assertEqual(data_dir_periods("data_2027.13"), [])
+        self.assertEqual(data_dir_periods("data_2027.00"), [])
+        self.assertEqual(data_dir_periods("data_2027.11_2027.13"), [])
+        self.assertEqual(latest_data_dir(self.root).name, "data_2027.11")
+        names = [p.name for p in unrecognized_data_dirs(self.root)]
+        self.assertEqual(names, ["data_2027.00", "data_2027.11_2027.13", "data_2027.13"])
+
     def test_unrecognized_data_dirs(self) -> None:
         # data_ 前缀但不符合命名规则的目录（不补零、备份、临时目录）单独列出，
         # 供 CLI 提示；合规目录与 *_clear / 非 data_ 目录不算。
