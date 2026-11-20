@@ -15,10 +15,15 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from openpyxl import load_workbook
 
 from .periods import parse_periods, period_index
+
+
+class EmptyExportError(ValueError):
+    """模板导出 0 行（通常选错了期间/工作簿）；调用方应提示用户而不是覆盖旧数据。"""
 
 
 def _s(v: Any) -> str:
@@ -71,17 +76,25 @@ EXPORT_FILES = (
 )
 
 
-def _clean_output(out_dir: Path, names=EXPORT_FILES) -> None:
-    """删除输出目录里上一轮的 CSV。
+def _replace_dir(staging: Path, out_dir: Path) -> None:
+    """用同盘的 staging 目录整体替换 out_dir（失败时恢复旧目录）。
 
-    0 行的表也必须留下只有表头的文件；否则旧文件会残留，被 run-flow 当成
-    本次数据上传（错误数据进 BPC）。单独抽出来也方便测试。
+    staging 必须与 out_dir 同盘（由调用方建在 out_dir.parent 下），这样
+    rename 是原子的；不能逐个 shutil.move 跨盘复制，否则中途失败会留下
+    半新半旧的目录。
     """
-    for name in names:
-        try:
-            (out_dir / name).unlink(missing_ok=True)
-        except OSError:
-            pass
+    backup: Path | None = None
+    if out_dir.exists():
+        backup = out_dir.with_name(f".{out_dir.name}.bak-{uuid4().hex[:8]}")
+        out_dir.rename(backup)
+    try:
+        staging.rename(out_dir)
+    except Exception:
+        if backup is not None and not out_dir.exists():
+            backup.rename(out_dir)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
 
 
 def _dump(out_dir: Path, name: str, rows: list[dict], fieldnames: list[str]) -> int:
@@ -94,39 +107,50 @@ def _dump(out_dir: Path, name: str, rows: list[dict], fieldnames: list[str]) -> 
     return len(rows)
 
 
-def export_template(xlsx_path: Path, periods: Any, out_dir: Path, zero: bool = False) -> dict[str, int]:
+def export_template(xlsx_path: Path, periods: Any, out_dir: Path, zero: bool = False,
+                    min_rows: int = 0) -> dict[str, int]:
     """导出 5 份 CSV 到 out_dir，返回 {文件名: 行数}。
 
     periods 可为 'YYYY.MM'、'YYYY.MM-YYYY.MM'、'YYYY.MM,YYYY.MM' 或列表。
     zero=True 时所有值填 0（供批量清除复用）。
     公式未缓存（data_only 读不到值）时自动回退 data_only=False 重读。
+    min_rows>0 时总行数不足会抛 EmptyExportError，且不触碰 out_dir
+    （Web 上传用 1 拒绝 0 行模板，避免先删旧数据再报错）。
 
-    先导出到临时目录，5 份 CSV 都生成成功后一次性替换 out_dir 里的旧文件；
-    模板打不开、表单缺失等中途失败不会破坏上一轮的导出结果。
+    先在同盘 staging 目录导出，5 份 CSV 齐全后再整体替换 out_dir；
+    模板打不开、表单缺失、中途复制失败都不会破坏上一轮结果。
     """
     periods = _normalize_periods(periods)
     if not xlsx_path.exists():
         raise FileNotFoundError(f"模板文件不存在: {xlsx_path}")
+    out_dir = Path(out_dir)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
 
     def load(data_only: bool):
         return load_workbook(xlsx_path, read_only=True, data_only=data_only)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
+    staging = Path(tempfile.mkdtemp(prefix=f".{out_dir.name}.tmp-", dir=out_dir.parent))
+    try:
         wb = load(True)
-        result = _export(wb, periods, tmp_dir, zero)
+        try:
+            result = _export(wb, periods, staging, zero)
+        finally:
+            wb.close()                      # 导出异常时也要释放模板文件句柄
         if sum(result.values()) == 0:
-            wb.close()
             wb = load(False)
-            result = _export(wb, periods, tmp_dir, zero)
-        wb.close()
-        missing = [n for n in EXPORT_FILES if not (tmp_dir / n).exists()]
+            try:
+                result = _export(wb, periods, staging, zero)
+            finally:
+                wb.close()
+        missing = [n for n in EXPORT_FILES if not (staging / n).exists()]
         if missing:
             raise RuntimeError(f"导出不完整，缺少文件: {'、'.join(missing)}")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        _clean_output(out_dir)
-        for name in EXPORT_FILES:
-            shutil.move(str(tmp_dir / name), str(out_dir / name))
+        if sum(result.values()) < min_rows:
+            raise EmptyExportError(
+                "导出行数为 0，请确认模板表是否选择了正确的期间/工作簿")
+        _replace_dir(staging, out_dir)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return result
 
 

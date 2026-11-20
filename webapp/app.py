@@ -478,9 +478,12 @@ def api_upload():
     WEB_RUN_DIR.mkdir(parents=True, exist_ok=True)
     file.save(str(tmp))
     try:
-        from engine.template_export import export_template
+        from engine.template_export import EmptyExportError, export_template
         out_dir = APP_ROOT / _data_dir_name(periods)
-        rows = export_template(tmp, periods, out_dir)
+        # min_rows=1：0 行模板在替换目录之前就报错，不破坏上一份正确数据
+        rows = export_template(tmp, periods, out_dir, min_rows=1)
+    except EmptyExportError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"ok": False, "error": f"导出失败：{exc}"}), 500
     finally:
@@ -490,8 +493,6 @@ def api_upload():
             pass
 
     total = sum(rows.values())
-    if total == 0:
-        return jsonify({"ok": False, "error": "导出行数为 0，请确认模板表是否选择了正确的期间/工作簿"}), 400
     return jsonify({"ok": True, "rows": rows, "total": total, "data_dir": out_dir.name,
                     "periods": periods,
                     "warnings": csv_dimension_warnings(out_dir)})

@@ -11,7 +11,7 @@ import _stubs  # noqa: F401
 
 from openpyxl import Workbook
 
-from engine.template_export import EXPORT_FILES, export_template
+from engine.template_export import EXPORT_FILES, EmptyExportError, export_template
 
 
 def _make_template(path: Path) -> None:
@@ -102,6 +102,22 @@ class ExportTests(unittest.TestCase):
         for name in EXPORT_FILES:
             self.assertEqual((self.out / name).read_text(encoding="utf-8"), "OLD\n",
                              f"{name} 在导出失败后被清掉了")
+
+    def test_min_rows_zero_keeps_previous_output(self) -> None:
+        # Web 上传 0 行模板：必须在替换目录之前失败，旧数据保持原样
+        self._write_stale()
+        with self.assertRaises(EmptyExportError):
+            export_template(self.template, ["2027.02"], self.out, min_rows=1)
+        for name in EXPORT_FILES:
+            self.assertEqual((self.out / name).read_text(encoding="utf-8"), "OLD\n",
+                             f"{name} 在 0 行导出后被清掉了")
+
+    def test_staging_and_backup_dirs_are_cleaned_up(self) -> None:
+        self._write_stale()
+        export_template(self.template, ["2027.01"], self.out)
+        leftovers = [p.name for p in self.out.parent.iterdir()
+                     if p.name.startswith(f".{self.out.name}.")]
+        self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":

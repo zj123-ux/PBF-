@@ -41,7 +41,7 @@ from engine import (ExcelEngine, ExcelError, FormWriter, Navigator, RunPackageRu
                     FormReader, FormScanner, ensure_excel_ready, run_flow)
 from engine.business_units import (UnitError, apply_unit, check_units,
                                    csv_dimension_warnings, default_unit)
-from engine.clear import clear_data
+from engine.clear import FORM_SCHEMA, clear_data
 from engine.config_check import Issue, check_flow, check_form_config
 from engine.periods import parse_periods
 from engine.template_export import export_template
@@ -488,13 +488,17 @@ def cmd_clear(args) -> None:
     print(f"数据来源: {', '.join(d.name for d in data_dirs)}")
     print(f"输出: {out_dir}")
     try:
-        rows = clear_data(data_dirs, periods, out_dir)
+        rows = clear_data(data_dirs, periods, out_dir, require_all=args.run)
     except ValueError as exc:
         print(f"\n[清除中止] {exc}")
         raise SystemExit(1)
     print("\n[清除结果]（全 0）")
     for name, n in rows.items():
         print(f"  {name}: {n} 行")
+    partial = [name for name in FORM_SCHEMA if name not in rows]
+    if partial and not args.run:
+        print(f"[提示] 以下表单来源无数据，输出目录不含对应 CSV（不能直接用于 run-flow）："
+              f"{'、'.join(partial)}")
     audit_log("clear", {"periods": periods, "data_dirs": [str(d) for d in data_dirs],
                         "out_dir": str(out_dir), "rows": rows})
 

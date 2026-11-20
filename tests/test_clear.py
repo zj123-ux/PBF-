@@ -51,6 +51,16 @@ class ClearTests(unittest.TestCase):
             clear_data([empty], ["2027.01"], self.out)
         self.assertEqual(stale.read_text(encoding="utf-8"), "PREVIOUS\n")
 
+    def test_require_all_refuses_partial_and_keeps_output(self) -> None:
+        # clear --run：来源缺表时在删除旧文件之前中止，避免先报成功再必然失败
+        for name in FORM_SCHEMA:
+            (self.out / name).write_text("OLD\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "没有可清除的行"):
+            clear_data([self.src], ["2027.01"], self.out, require_all=True)
+        for name in FORM_SCHEMA:
+            self.assertEqual((self.out / name).read_text(encoding="utf-8"), "OLD\n",
+                             f"{name} 在 require_all 中止后被改动了")
+
     def test_removes_stale_files_and_writes_zeros(self) -> None:
         for name in FORM_SCHEMA:
             (self.out / name).write_text("OLD\n", encoding="utf-8")
