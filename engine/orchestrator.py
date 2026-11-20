@@ -14,6 +14,7 @@ import fnmatch
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -21,8 +22,8 @@ from typing import Any, Optional
 import pandas as pd
 import yaml
 
-from .excel import ExcelEngine, ExcelError, is_disconnect
-from .bootstrap import ensure_excel_ready
+from .excel import ExcelEngine, ExcelError, RecoverableError, is_disconnect
+from .bootstrap import ensure_excel_ready, kill_excel
 from .header_periods import normalize_period_header
 from .navigator import Navigator
 from .writer import FormWriter
@@ -177,12 +178,16 @@ class PbfFlow:
         raise last  # type: ignore[misc]
 
     def recover(self) -> bool:
-        """Excel 断开后自动恢复：重开导航表 → 重新登录 → 换上新的引擎。
+        """Excel 断开/卡死后自动恢复：结束进程 → 重开导航表 → 重新登录。
 
         返回 True 表示已恢复，调用方可以重做失败的步骤；False 表示恢复失败。
         """
         rcfg = self.cfg.get("recovery") or {}
-        log.warning("Excel 连接已断开，开始自动恢复…")
+        log.warning("Excel 已断开或卡死，开始重启 Excel 并恢复…")
+        try:
+            self.engine.stop_dialog_guard()
+        except Exception:
+            pass
         # 只结束本流程连接的那个 Excel 进程；不碰用户同时打开的其它 Excel。
         stale_pid = getattr(self.engine, "pid", None)
         try:
@@ -227,6 +232,7 @@ class PbfFlow:
             self.refresh_flow_retry(attempts=3, delay=5)
         except Exception as exc:
             log.warning(f"恢复后刷新流程失败（继续尝试）: {exc}")
+        self.engine.start_dialog_guard()
         log.info("自动恢复完成，可以继续执行")
         return True
 
@@ -304,7 +310,11 @@ class PbfFlow:
                 return late
             log.warning(f"第 {attempt} 次点击 {btn} 未打开工作簿，重试（当前：{last_names}）")
             time.sleep(2)
-        raise ExcelError(f"选中 {nav_cell} 并点击 {btn} 后未打开新工作簿（已重试 3 次）")
+        # 反复点不开 = 表单窗口已经卡死（残留实例、模态弹窗、AO 会话异常）。
+        # 继续在同一个 Excel 上重试只会越来越慢，交给上层重启 Excel 后从本步骤重做。
+        raise RecoverableError(
+            f"选中 {nav_cell} 并点击 {btn} 后未打开新工作簿（已重试 3 次，"
+            f"当前打开：{last_names}）")
 
     def _find_opened(self, pattern: Optional[str], expect: str) -> Optional[str]:
         """当前已打开的工作簿里，是否已有符合期望的那个（用于重试兜底）。"""
@@ -346,13 +356,26 @@ class PbfFlow:
         if not res.get("saved"):
             return res
 
-        # 保存"没报错"不等于数据真的进了 BPC：关闭不保存 → 重开 → 读回本次写入的格子。
+        # 保存"没报错"不等于数据真的进了 BPC：刷新（或关表重开）后读回本次写入的格子。
         # 任一格对不上就判该步骤失败，避免带着错误数据继续跑计算和运行包。
         enabled = bool(self.wb_cfg.get("enabled", True))
         if cfg.get("verify_writeback") is False:
             enabled = False
         if enabled:
-            fails = self.verify_persisted(form_id, step["nav_cell"], res.get("cells") or {})
+            # 默认原地刷新校验：不关表重开，快一倍，也不会因为反复开关同一张表卡死。
+            # 表单配置里写 verify_mode: reopen 可恢复"关表重开"的最严格校验。
+            mode = str(cfg.get("verify_mode") or self.wb_cfg.get("mode") or "refresh").lower()
+            cells = res.get("cells") or {}
+            if mode == "reopen":
+                fails = self.verify_persisted(form_id, step["nav_cell"], cells)
+            else:
+                try:
+                    fails = self.verify_refreshed(form_id, cells)
+                except Exception as exc:
+                    if is_disconnect(exc) or isinstance(exc, RecoverableError):
+                        raise
+                    log.warning(f"{form_id}: 原地刷新校验失败（{exc}），改用关表重开校验")
+                    fails = self.verify_persisted(form_id, step["nav_cell"], cells)
             res["verified"] = not fails
             if fails:
                 res.setdefault("failures", []).extend(f"落库校验 {f}" for f in fails[:5])
@@ -360,29 +383,16 @@ class PbfFlow:
                     res["failures"].append(f"落库校验失败共 {len(fails)} 格（仅列出前 5 格）")
         return res
 
-    def verify_persisted(self, form_id: str, nav_cell: str, cells: dict) -> list[str]:
-        """关闭工作簿（不保存）→ 经导航表重开 → 读回比对，确认数据已落到 BPC。
-
-        返回不一致项列表（空列表 = 全部通过）。可用 flow.yaml 的
-        `verify_writeback.sample` 抽样加速；默认全量，一次 600 格的读回约几秒。
-        """
-        cfg = self.form_cfgs[form_id]
-        pattern = cfg["workbook_pattern"]
-        items = list(cells.items())
+    def _verify_items(self, cells: dict) -> tuple[list[tuple[str, Any]], float]:
+        items = list((cells or {}).items())
         sample = int(self.wb_cfg.get("sample") or 0)
         if sample and len(items) > sample:
             step = max(1, len(items) // sample)
             items = items[::step][:sample]
-        if not items:
-            return []
-        tol = float(self.wb_cfg.get("tolerance", 0.01))
+        return items, float(self.wb_cfg.get("tolerance", 0.01))
 
-        self._close_if_open(pattern)
-        self.open_via_nav(nav_cell, self.nav_cfg["open_button_cell"], "form",
-                          pattern=pattern)
-        wb = self.engine.get_workbook(pattern, wait_sec=60)
-        ws = self.engine.open_sheet(wb, cfg["sheet"])
-
+    def _compare_cells(self, ws, items: list[tuple[str, Any]], tol: float,
+                       when: str) -> list[str]:
         failures: list[str] = []
         for cell, expected in items:
             actual = self._read(ws, cell)
@@ -393,7 +403,52 @@ class PbfFlow:
             except (TypeError, ValueError):
                 ok = str(actual).strip() == str(expected).strip()
             if not ok:
-                failures.append(f"{cell}: 期望 {expected!r}, 重开后 {actual!r}")
+                failures.append(f"{cell}: 期望 {expected!r}, {when} {actual!r}")
+        return failures
+
+    def verify_refreshed(self, form_id: str, cells: dict) -> list[str]:
+        """保存后**原地刷新**（Refresh_Sheet）再读回，不关表重开。
+
+        Plan_Save 成功后 AO 的计划缓冲区里本来就是新值，直接读不能证明已落库；
+        Refresh_Sheet 会从 BPC 重新拉取数据源，读回一致才算真的保存成功。
+        相比"关闭 → 经导航重开 → 读回"，省掉一次完整开关表（每张表 30-60 秒），
+        也避免反复开关同一张表触发 AO 卡死。
+        """
+        cfg = self.form_cfgs[form_id]
+        wb = self.engine.get_workbook(cfg["workbook_pattern"], wait_sec=30)
+        ws = self.engine.open_sheet(wb, cfg["sheet"])
+        items, tol = self._verify_items(cells)
+        if not items:
+            return []
+
+        macro = (cfg.get("macros") or {}).get("refresh") or "Refresh_Sheet"
+        t0 = time.time()
+        self.engine.run_macro(macro, wb)
+        time.sleep(3)
+        failures = self._compare_cells(ws, items, tol, "刷新后")
+        log.info(f"{form_id}: 原地刷新校验 {len(items)} 格，失败 {len(failures)} 格"
+                 f"（{int(time.time() - t0)}s）")
+        return failures
+
+    def verify_persisted(self, form_id: str, nav_cell: str, cells: dict) -> list[str]:
+        """关闭工作簿（不保存）→ 经导航表重开 → 读回比对，确认数据已落到 BPC。
+
+        最严格的校验方式，但每张表要多开关一次（30-60 秒）。默认改用
+        verify_refreshed；表单配置里写 `verify_mode: reopen` 可强制走这里。
+        """
+        cfg = self.form_cfgs[form_id]
+        pattern = cfg["workbook_pattern"]
+        items, tol = self._verify_items(cells)
+        if not items:
+            return []
+
+        self._close_if_open(pattern)
+        self.open_via_nav(nav_cell, self.nav_cfg["open_button_cell"], "form",
+                          pattern=pattern)
+        wb = self.engine.get_workbook(pattern, wait_sec=60)
+        ws = self.engine.open_sheet(wb, cfg["sheet"])
+
+        failures = self._compare_cells(ws, items, tol, "重开后")
 
         # 故意不关闭：后续可能需要在这张表上执行计算宏（如 Execute_PS），
         # 由调用方在收尾时统一 close_form。
@@ -543,17 +598,29 @@ class PbfFlow:
             for period, col in periods.items():
                 out[name][period] = self._read(ws, f"{col}{row}")
 
-        # 指标合理性：目标期间全空/全 0 基本意味着运行包没生效，不能当成功结果返回
-        if target:
-            vals = {name: _num(rows.get(target)) for name, rows in out.items()}
-            if all(v is None or v == 0 for v in vals.values()):
+        self._check_indicators(out, target)
+        return out
+
+    def _check_indicators(self, out: dict[str, dict[str, Any]], target: str) -> None:
+        """指标合理性：目标期间全空/全 0 基本意味着运行包没生效，不能当成功返回。
+
+        例外：批量清除（数据目录 *_clear）的目标本来就是全 0，此时全 0 是预期结果。
+        """
+        if not target:
+            return
+        vals = {name: _num(rows.get(target)) for name, rows in out.items()}
+        if all(v is None or v == 0 for v in vals.values()):
+            if "_clear" in self.data_dir.name:
+                log.warning(
+                    f"损益核对 {target} 的指标全部为 0：本次是批量清除（{self.data_dir.name}），"
+                    "清零后损益为 0 属预期结果")
+            else:
                 raise ExcelError(
                     f"损益核对 {target} 的指标全部为空或为 0，运行包可能未生效。"
                     f"请先确认三个运行包状态为「已完成」后重试。指标: {list(out)}")
-            zero = [name for name, v in vals.items() if v is None or v == 0]
-            if zero:
-                log.warning(f"损益核对 {target} 以下指标为 0/空: {zero}")
-        return out
+        zero = [name for name, v in vals.items() if v is None or v == 0]
+        if zero:
+            log.warning(f"损益核对 {target} 以下指标为 0/空: {zero}")
 
     # ---------- 期间解析 ----------
 
@@ -721,26 +788,55 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
                 raise ExcelError("AO 自动登录失败，请手动登录后重试")
             report["login"] = True
 
+    # 全流程后台关闭 PBF 提示弹窗：弹窗不关会把后续的点击/读取 COM 调用全部堵死
+    flow.engine.start_dialog_guard()
+
     rcfg = flow_cfg.get("recovery") or {}
     recovery_on = bool(rcfg.get("enabled", True))
     max_retries = int(rcfg.get("max_retries", 1)) if recovery_on else 0
 
+    # 关闭恢复时不主动结束 Excel（没有重试兜底，杀了就只会把流程判死）
+    stall_timeout = float(rcfg.get("stall_timeout_sec", 600) or 0) if recovery_on else 0
+
     def run_with_recovery(fn, label: str):
-        """执行 fn；若因 Excel 断开失败且开启了恢复，重开 Excel 后重做一次。"""
+        """执行 fn；若 Excel 断开或卡死且开启了恢复，重启 Excel 后从该步重做一次。"""
         attempts = max_retries + 1
         for attempt in range(1, attempts + 1):
             steps_len, pkgs_len = len(report["steps"]), len(report["packages"])
+            # 单步卡死看门狗：COM 调用被模态弹窗/服务端挂住时，主线程无法自己超时，
+            # 只能从外部结束该 Excel 进程，让调用抛断线错误，交给下面的恢复逻辑。
+            stop = threading.Event()
+            if stall_timeout > 0:
+                pid = getattr(flow.engine, "pid", None)
+
+                def _stall_guard(p=pid, ev=stop) -> None:
+                    if ev.wait(stall_timeout):
+                        return
+                    if p is None:
+                        log.error(f"{label} 超过 {stall_timeout:.0f}s 无进展，但拿不到 Excel PID，"
+                                  "不敢结束进程（请手动处理窗口后重试）")
+                        return
+                    log.error(f"{label} 超过 {stall_timeout:.0f}s 无进展，判定 Excel 卡死，"
+                              f"结束进程 PID={p} 后重启")
+                    kill_excel(p)
+
+                threading.Thread(target=_stall_guard, daemon=True).start()
             try:
                 return fn()
             except Exception as exc:            # 包含未包装的 com_error
                 del report["steps"][steps_len:]      # 丢掉这次重试前的半成品记录
                 del report["packages"][pkgs_len:]
-                if attempt >= attempts or not is_disconnect(exc):
+                # RecoverableError = 表单反复打不开/点了没反应，属于 Excel 层面的卡死，
+                # 和断线一样处理：重启 Excel 从本步骤重做，而不是在原窗口上硬撑。
+                if attempt >= attempts or not (is_disconnect(exc)
+                                               or isinstance(exc, RecoverableError)):
                     raise
-                log.warning(f"{label} 因 Excel 断开失败：{exc}")
+                log.warning(f"{label} 因 Excel 断开/卡死失败：{exc}")
                 if not flow.recover():
                     raise
-                log.info(f"Excel 已恢复，重做：{label}")
+                log.info(f"Excel 已恢复，从本步骤重做：{label}")
+            finally:
+                stop.set()
 
     # 5) 切版本（用户路径第 ⑤ 步）：先切到选定版本，再「刷新状态」。
     switched_display: Optional[str] = None
@@ -770,6 +866,7 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
                 lambda s=step: flow.preflight_form(s), f"预检 {idx}（{step['form']}）")
             res["index"] = idx
             report["preflights"].append(res)
+        flow.engine.stop_dialog_guard()
         return report
 
     def run_step(step: dict) -> None:
@@ -811,6 +908,7 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
 
     if only_verify:
         report["indicators"] = run_with_recovery(flow.read_indicators, "损益核对")
+        flow.engine.stop_dialog_guard()
         return report
 
     for i, step in enumerate(steps):
@@ -821,4 +919,5 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
         run_with_recovery(lambda s=step: run_step(s), f"步骤 {i + 1}（{form_id}）")
 
     report["indicators"] = run_with_recovery(flow.read_indicators, "损益核对")
+    flow.engine.stop_dialog_guard()
     return report

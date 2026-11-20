@@ -162,6 +162,18 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
     pattern = nav.get("workbook_pattern", "PBF Pro - 全面预算系统流程导航*")
     path = Path(nav["launch_file"]) if nav.get("launch_file") else None
 
+    # 0) 断开/卡死恢复：必须**先**结束本工具连接的那个进程，再谈"复用"。
+    #    否则下面的第 1 步会连回同一个卡死的 Excel（导航表还开着），恢复等于没做。
+    #    只结束指定 PID；定位不到时宁可跳过，也不要 taskkill 掉用户其它 Excel。
+    if kill_stale:
+        running = excel_pids()
+        if stale_pid and stale_pid in running:
+            kill_excel(stale_pid)
+        elif running:
+            log.warning(
+                f"未定位到需要结束的 Excel 进程（目标 PID={stale_pid}），"
+                f"跳过强制结束，避免影响其它 Excel 窗口")
+
     # 1) 已经就绪（真实 Excel 里导航表已打开）——仅当确有 Excel 进程时才去连，
     #    否则 ExcelEngine 的 Dispatch 会拉起一个空 Excel，还得再关掉，反而制造竞态。
     if excel_pids():
@@ -190,18 +202,7 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
         except ExcelError:
             pass
 
-    # 3) 断开重连时：残留进程可能已经僵死，只结束本工具连接的那个 PID。
-    #    定位不到目标时宁可跳过，也不要 taskkill 掉用户其它 Excel（可能有未保存内容）。
-    if kill_stale:
-        running = excel_pids()
-        if stale_pid and stale_pid in running:
-            kill_excel(stale_pid)
-        elif running:
-            log.warning(
-                f"未定位到需要结束的 Excel 进程（目标 PID={stale_pid}），"
-                f"跳过强制结束，避免影响其它 Excel 窗口")
-
-    # 4) 打开导航表
+    # 3) 打开导航表
     #    source=bw（默认）：启动空白 Excel → 文件 → Analysis → 从 BW 平台现取导航表。
     #      本地 .xlsb 会带缓存的连接/版本上下文，切版本容易出错；BW 每次都是新副本。
     #    source=file：直接打开 flow.yaml 里配置的本地文件（旧方式，保留兜底）。

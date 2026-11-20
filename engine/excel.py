@@ -41,6 +41,14 @@ class ExcelError(RuntimeError):
     """Raised for any COM / Excel-side failure."""
 
 
+class RecoverableError(ExcelError):
+    """Excel 没断线但已经卡死（如反复点"打开"不出表单）。
+
+    和断线一样处理：结束本流程的 Excel 进程 → 重开导航表 → 重新登录 →
+    从失败的步骤重做，而不是在卡住的窗口上无限重试。
+    """
+
+
 # Excel 进程退出/断电后，COM 调用会报这些错，需要重开 Excel 而不是简单重试
 _DISCONNECT_MARKERS = (
     "已与其客户端断开连接",     # RPC_E_DISCONNECTED (-2147417848)
@@ -233,6 +241,25 @@ class ExcelEngine:
 
     # ---------- cell / range ----------
 
+    # ---------- 事件开关 ----------
+
+    def events_enabled(self) -> Optional[bool]:
+        """读取 Application.EnableEvents；读不到返回 None。"""
+        try:
+            return bool(self._excel.EnableEvents)
+        except Exception:
+            return None
+
+    def ensure_events(self) -> bool:
+        """确保 EnableEvents=True。返回 True 表示之前是关闭的（被强制打开）。"""
+        try:
+            if not bool(self._excel.EnableEvents):
+                self._excel.EnableEvents = True
+                return True
+        except Exception:
+            pass
+        return False
+
     def read(self, sheet: Any, cell: str) -> Any:
         try:
             v = sheet.Range(cell).Value2
@@ -363,6 +390,34 @@ class ExcelEngine:
             win32gui.SendMessage(buttons[0], win32con.BM_CLICK, 0, 0)
             return True
         return False
+
+    def start_dialog_guard(self) -> None:
+        """整个流程期间在后台关闭已知的 PBF 提示弹窗。
+
+        导航表点"打开"、表单刷新时也可能弹模态框；弹窗不关，外部 COM 调用会一直
+        阻塞（实测卡了 5 分钟以上），日志里只看到"未打开工作簿，重试"。
+        """
+        if getattr(self, "_guard_stop", None) is not None:
+            return
+        import threading
+
+        try:
+            import win32process
+
+            pid = int(win32process.GetWindowThreadProcessId(int(self._excel.Hwnd))[1])
+        except Exception as exc:
+            log.debug(f"弹窗看门狗未启动: {exc}")
+            return
+        stop = threading.Event()
+        threading.Thread(target=self._dismiss_dialogs_loop,
+                         args=(pid, stop, []), daemon=True).start()
+        self._guard_stop = stop
+
+    def stop_dialog_guard(self) -> None:
+        stop = getattr(self, "_guard_stop", None)
+        if stop is not None:
+            stop.set()
+            self._guard_stop = None
 
     def _dismiss_dialogs_loop(self, pid: int, stop, seen: list[str]) -> None:
         """后台线程：关闭 PBF 的提示弹窗，并记录所有模态弹窗。

@@ -20,12 +20,21 @@ recovery:
   enabled: true
   max_retries: 1                # 每个步骤/核对最多重做 1 次
   kill_stale_excel: true        # 重连前只结束本工具连接的那个 Excel 进程（不会动用户其它 Excel）
+  stall_timeout_sec: 600        # 单步超过 10 分钟无进展 = Excel 卡死：结束该进程后重启并重做本步
+                                # （表单反复打不开、被模态弹窗挂住时，主线程自己无法超时）
 
 # ---------- 写入后落库校验 ----------
-# 每张表保存后：关闭工作簿(不保存) → 经导航表重开 → 读回本次写入的每一格。
-# 任何一格对不上都会中止流程；AO 报「没有要保存的数据」但确有新值时同样判失败。
+# 每张表保存后读回本次写入的每一格，任何一格对不上都会中止流程。
+#   refresh（默认）= 原地执行 Refresh_Sheet 从 BPC 重新拉数后读回，不关表重开；
+#   reopen         = 关闭工作簿(不保存) → 经导航表重开 → 读回（最严格，但每张表多 30-60 秒，
+#                    且反复开关同一张表容易让 AO 卡死，仅在怀疑刷新读回不可靠时使用）。
+# 单张表可用表单 YAML 里的 verify_mode 覆盖。
+# 保存前还会检查 SAPGetProperty("HasChangedPlanData")：写入后 AO 若没记录到变更
+# （PBF 的 VBA 回调会临时关闭 Application.EnableEvents，写入落在该窗口里就不会触发
+# SheetChange），先强制开启事件重写一次；仍无效则直接判失败、不调用保存。
 verify_writeback:
   enabled: true
+  mode: refresh          # refresh=原地刷新读回（默认）；reopen=关表重开读回
   tolerance: 0.01        # 数值绝对误差
   sample: 0              # 0=全量校验；>0=均匀抽样 N 格（提速但可能漏检）
 

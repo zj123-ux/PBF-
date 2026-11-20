@@ -432,6 +432,33 @@ class FormWriter:
                 })
         return matched, skipped
 
+    # ---------- AO 状态校验 ----------
+
+    def _wait_pbf_ready(self, timeout: float = 20.0) -> None:
+        """等待 PBF 表单初始化结束（Application.EnableEvents 恢复为 True）。
+
+        PBF 模板的回调都是"先关事件、做完再开"（导航表 Callback_AfterRedisplay、
+        表单 Callback_AfterRedisplay / Refresh_Sheet / Switch_mode / Copy_Range）。
+        外部写入如果落在这个窗口里，Excel 不触发 SheetChange，AO 收不到变更，
+        Plan_Save 就会立刻弹「没有要保存的数据」（2026-11-20 批量清除复现）。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.engine.events_enabled() is not False:
+                return
+            time.sleep(0.5)
+        log.warning(f"等待 Excel 事件恢复超时（{timeout:.0f}s）")
+        if self.engine.ensure_events():
+            log.warning("已强制开启 Application.EnableEvents（PBF 宏未恢复事件）")
+
+    def _plan_data_dirty(self) -> Optional[bool]:
+        """AO 是否记录了未保存的计划数据变更；读取失败返回 None。"""
+        try:
+            return bool(self.engine.run_macro("SAPGetProperty", None, "HasChangedPlanData"))
+        except ExcelError as exc:
+            log.debug(f"读取 HasChangedPlanData 失败: {exc}")
+            return None
+
     # ---------- write cycle ----------
 
     def write_and_save(self, preflight: PreflightResult, verify_after: bool = True) -> dict:
@@ -454,7 +481,14 @@ class FormWriter:
             result["failures"].append(f"edit_mode: {exc}")
             return result
 
+        changed = [r for r in preflight.matched_rows
+                   if not _same_value(r.get("old_value"), r.get("new_value"))]
+
         # 1. write
+        self._wait_pbf_ready()
+        if self.engine.ensure_events():
+            log.warning("写入前 Excel 事件处于关闭状态（PBF 宏未恢复），已强制开启")
+        before_dirty = self._plan_data_dirty()
         log.info(f"Writing {len(updates)} cells into {wb.Name}")
         try:
             self.engine.write_batch(sheet, updates)
@@ -462,6 +496,33 @@ class FormWriter:
         except ExcelError as exc:
             result["failures"].append(f"write_batch: {exc}")
             return result
+
+        # 写入后立刻确认 AO 收到了变更：事件被关掉或表单还在初始化时，单元格虽然
+        # 写进去了，但 AO 的计划缓冲区没有更新，后面 Plan_Save 必然弹"没有要保存"。
+        dirty = self._plan_data_dirty()
+        log.info(f"写入后 HasChangedPlanData={dirty}（写入前={before_dirty}）")
+        if changed and dirty is False:
+            log.warning("写入后 HasChangedPlanData=False：AO 未记录本次变更，重写一次")
+            time.sleep(1.0)
+            if self.engine.ensure_events():
+                log.warning("重写前 Excel 事件处于关闭状态，已强制开启")
+            try:
+                self.engine.write_batch(sheet, updates)
+            except ExcelError as exc:
+                result["failures"].append(f"write_batch(重试): {exc}")
+                return result
+            dirty = self._plan_data_dirty()
+        if changed and dirty is False:
+            back = sum(1 for cell, want in updates.items()
+                       if not _same_value(self.engine.read(sheet, cell), want))
+            result["saved"] = False
+            result["failures"].append(
+                "写入后 AO 未记录任何变更（HasChangedPlanData=False），重写一次仍无效；"
+                f"回读 {len(updates)} 格中有 {back} 格与目标值不同。未调用保存")
+            log.error(result["failures"][-1])
+            return result
+        if before_dirty:
+            log.info("写入前 AO 已有未保存变更，HasChangedPlanData 保持 True")
 
         # 2. save
         result["cells"] = {row["cell"]: row["new_value"] for row in preflight.matched_rows}
@@ -473,8 +534,6 @@ class FormWriter:
             # 有新值却被告知"没有要保存的数据"：说明本次写入没被接受（常见于未进入
             # 编制态、单元格只读）。不能当成"数据未变化"放过，否则后续计算会基于
             # 旧数据一路跑下去，最终输出"看似成功"的错误结果。
-            changed = [r for r in preflight.matched_rows
-                       if not _same_value(r.get("old_value"), r.get("new_value"))]
             if unchanged and changed:
                 sample = changed[0]
                 result["saved"] = False
@@ -494,9 +553,9 @@ class FormWriter:
             result["failures"].append(f"save: {exc}")
             return result
 
-        # 3. 验证
-        # 注意：AO 的 Refresh_Sheet 会关闭当前工作簿，导致后续读取拿到失效对象。
-        # 因此默认不在原地刷新，落库验证交给上层「关闭不保存 → 重开 → 读值」。
+        # 3. 验证（默认关闭）
+        # 流程里落库验证统一由编排层做：保存后原地 Refresh_Sheet 读回（默认），
+        # 或配置成「关闭不保存 → 重开 → 读值」。这里保留给 verify_mode=refresh 的独立调用。
         if verify_after and self.cfg.get("verify_mode") == "refresh":
             time.sleep(2.0)
             refresh_macro = mac.get("refresh")

@@ -616,10 +616,22 @@ def cmd_run_flow(args) -> None:
           f" | 仅核对: {args.only_verify}"
           + (f" | 从步骤 {args.from_step} 开始" if args.from_step else "") + "\n")
 
-    # 先做离线校验：配置/数据有问题时不要启动 Excel、更不要跑到一半才失败
+    # 先做离线校验：配置/数据有问题时不要启动 Excel、更不要跑到一半才失败。
+    # --from-step 可以是序号或表单 ID；校验层只接受 1 起的整数序号，
+    # 直接传字符串会在 check_flow 里做 int/str 比较时报 TypeError。
+    start_no = 1
+    if args.from_step:
+        key = str(args.from_step).strip()
+        if key.isdigit():
+            start_no = int(key)
+        else:
+            idx = next((i for i, s in enumerate(flow_cfg["steps"]) if s["form"] == key), None)
+            if idx is not None:
+                start_no = idx + 1
+    start_no = max(1, min(start_no, len(flow_cfg["steps"]) or 1))
     validate_before_run(flow_cfg, form_cfgs, data_dir,
                         check_data=not (args.skip_fill or args.only_verify),
-                        from_step=args.from_step or 1)
+                        from_step=start_no)
 
     engine = ensure_excel_ready(flow_cfg)
 
