@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from webapp.runs import RunRegistry, should_hold_slot
+from webapp.runs import RunRegistry, can_force_release, should_hold_slot
 
 
 class ShouldHoldSlotTest(unittest.TestCase):
@@ -27,6 +27,24 @@ class ShouldHoldSlotTest(unittest.TestCase):
 
     def test_normal_completion_releases(self):
         self.assertFalse(should_hold_slot({}, proc_alive=False, excel_running=True))
+
+
+class CanForceReleaseTest(unittest.TestCase):
+    def test_stuck_finished_dead_proc_can_release(self):
+        self.assertTrue(can_force_release({"done": True, "stuck": True},
+                                          proc_alive=False))
+
+    def test_live_proc_cannot_release(self):
+        self.assertFalse(can_force_release({"done": True, "stuck": True},
+                                           proc_alive=True))
+
+    def test_not_stuck_cannot_release(self):
+        self.assertFalse(can_force_release({"done": True, "stuck": False},
+                                           proc_alive=False))
+
+    def test_not_done_cannot_release(self):
+        self.assertFalse(can_force_release({"done": False, "stuck": True},
+                                           proc_alive=False))
 
 
 class RunRegistryTest(unittest.TestCase):

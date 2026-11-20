@@ -17,6 +17,10 @@ from .excel import ExcelEngine, ExcelError, reset_active_excel
 
 log = logging.getLogger(__name__)
 
+# 复用已打开的 Excel 时守候登录框的时长。AO 加载约 10s 后才弹登录框；
+# 已用缓存凭据登录时框不会出现，等满 60s 会让每次复用都空等一分钟。
+REUSE_LOGIN_WAIT_SEC = 15
+
 
 def excel_pids() -> list[int]:
     """当前 Excel 进程 PID 列表（tasklist 解析）。"""
@@ -172,7 +176,10 @@ def ensure_excel_ready(flow_cfg: dict, kill_stale: bool = False,
             # 起一个后台线程守候登录框（没出现就按超时自行退出），
             # 这样随后卡在模态登录框上的导航表/刷新调用会被自动解锁。
             # 结果句柄交给 run_flow 等 outcome，不能把"线程已启动"当登录成功。
-            handle = _start_ao_login(flow_cfg, quiet=True, timeout=60)
+            # 超时只给 REUSE_LOGIN_WAIT_SEC：登录框 10s 左右就会弹，
+            # 已登录时不会弹，等满 60s 纯属空等。
+            handle = _start_ao_login(flow_cfg, quiet=True,
+                                     timeout=REUSE_LOGIN_WAIT_SEC)
             return _mark_login(engine, launched_now=False, login_handle=handle)
         except ExcelError:
             pass

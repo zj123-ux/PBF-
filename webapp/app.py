@@ -18,7 +18,6 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 # 确保项目根在 sys.path（兼容 `python webapp/app.py` 与 `python -m webapp.app`）
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,7 +31,8 @@ from paths import app_root
 from data_dirs import latest_data_dir as find_latest_data_dir
 from engine.business_units import UnitError, csv_dimension_warnings, default_unit, get_unit
 from engine.periods import parse_periods
-from webapp.runs import RunRegistry, should_hold_slot
+from webapp.runs import RunRegistry, can_force_release, should_hold_slot
+from webapp.security import origin_allowed
 
 APP_ROOT = app_root()
 CONFIG_DIR = APP_ROOT / "config"
@@ -54,11 +54,8 @@ def _reject_cross_site_post():
     """
     if request.method != "POST":
         return None
-    origin = request.headers.get("Origin")
-    if not origin:
-        return None
-    host = urlparse(origin).hostname or ""
-    if host not in ("127.0.0.1", "localhost") and host != request.host.split(":")[0]:
+    if not origin_allowed(request.headers.get("Origin"), request.host,
+                          request.headers.get("Sec-Fetch-Site")):
         return jsonify({"ok": False, "error": "拒绝跨站 POST 请求"}), 403
     return None
 
@@ -218,7 +215,7 @@ def _busy_reason() -> str:
     state = REGISTRY.get(cur) if cur else None
     if state and state.get("stuck"):
         return ("上一次运行被取消/超时后未能确认 Excel 退出，运行槽位仍被占用；"
-                "请手动关闭残留的 EXCEL.EXE 后重试（关闭后本提示自动解除）")
+                "请关闭残留的 EXCEL.EXE，或确认没有宏在运行后点『强制释放槽位』再重试")
     return "已有一个流程在运行，请等待其结束"
 
 
@@ -328,13 +325,17 @@ def _spawn(params: dict) -> str | None:
                 pass
         finally:
             proc = state.get("proc")
-            state["proc"] = None
             state["done"] = True
             # 取消/超时后只有确认子进程死亡且 Excel 已退出才释放槽位；
             # 否则两个流程会操作同一个 Excel。卡住的占位在条件解除后由
             # _try_release_stuck_run() 自动放行。
             proc_alive = proc is not None and proc.poll() is None
-            if should_hold_slot(state, proc_alive, _excel_running()):
+            hold = should_hold_slot(state, proc_alive, _excel_running())
+            # 占位时保留 Popen：人工释放接口要确认子进程是否真的退出；
+            # 正常结束则清掉引用。
+            if not hold:
+                state["proc"] = None
+            if hold:
                 state["stuck"] = True
                 try:
                     with open(log_path, "a", encoding="utf-8") as lf:
@@ -605,6 +606,28 @@ def api_run_cancel(run_id: str):
     else:
         note = "已标记取消；当前步骤尚未启动子进程"
     return jsonify({"ok": True, "note": note})
+
+
+@app.route("/api/run/release", methods=["POST"])
+def api_run_release():
+    """人工释放"卡住的占位运行"。
+
+    Excel 由 COM 启动、taskkill 杀不到；若用户已确认 Excel 中没有仍在执行
+    的宏，又需要继续跑，就不应被卡死到只能重启服务。
+    """
+    cur = REGISTRY.current
+    state = REGISTRY.get(cur) if cur else None
+    if state is None:
+        return jsonify({"ok": False, "error": "当前没有占用运行槽位的运行"}), 409
+    proc = state.get("proc")
+    alive = proc is not None and proc.poll() is None
+    if not can_force_release(state, alive):
+        return jsonify({"ok": False,
+                        "error": "当前运行未处于可人工释放状态（仍在运行或未卡住）"}), 409
+    state["stuck"] = False
+    REGISTRY.end(cur)
+    return jsonify({"ok": True,
+                    "note": "已强制释放运行槽位；请确认 Excel 中没有仍在执行的宏"})
 
 
 @app.route("/api/env")

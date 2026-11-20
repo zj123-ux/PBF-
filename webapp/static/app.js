@@ -157,6 +157,7 @@ $("btn-run").addEventListener("click", async () => {
   });
   if (!r.ok) {
     setStatus($("run-status"), "启动失败：" + (r.error || ""), "err");
+    if ((r.error || "").includes("槽位")) $("btn-release").style.display = "";
     return;
   }
   currentRunId = r.run_id;
@@ -164,6 +165,7 @@ $("btn-run").addEventListener("click", async () => {
   $("result").innerHTML = "";
   $("btn-run").disabled = true;
   $("btn-clear").disabled = true;
+  $("btn-release").style.display = "none";
   $("btn-cancel").disabled = false;
   setStatus($("run-status"), "运行中…", "");
   pollLog(0);
@@ -189,6 +191,7 @@ $("btn-clear").addEventListener("click", async () => {
   });
   if (!r.ok) {
     setStatus($("run-status"), "清除启动失败：" + (r.error || ""), "err");
+    if ((r.error || "").includes("槽位")) $("btn-release").style.display = "";
     return;
   }
   currentRunId = r.run_id;
@@ -196,6 +199,7 @@ $("btn-clear").addEventListener("click", async () => {
   $("result").innerHTML = "";
   $("btn-run").disabled = true;
   $("btn-clear").disabled = true;
+  $("btn-release").style.display = "none";
   $("btn-cancel").disabled = false;
   setStatus($("run-status"), "清除运行中…", "");
   pollLog(0);
@@ -214,11 +218,21 @@ function pollLog(offset) {
     }
     if (r.done) {
       $("btn-cancel").disabled = true;
-      $("btn-run").disabled = !hasUploaded;
-      $("btn-clear").disabled = false;
-      setStatus($("run-status"),
-        r.exit_code === 0 ? "完成 ✓" : `结束（退出码 ${r.exit_code}）`,
-        r.exit_code === 0 ? "ok" : "err");
+      if (r.stuck) {
+        // 取消/超时后 Excel 未确认退出：槽位仍被占用，先别放行新流程
+        $("btn-release").style.display = "";
+        $("btn-run").disabled = true;
+        $("btn-clear").disabled = true;
+        setStatus($("run-status"),
+          "已结束，但 Excel 未退出：槽位被占用，确认无宏运行后可强制释放", "err");
+      } else {
+        $("btn-release").style.display = "none";
+        $("btn-run").disabled = !hasUploaded;
+        $("btn-clear").disabled = false;
+        setStatus($("run-status"),
+          r.exit_code === 0 ? "完成 ✓" : `结束（退出码 ${r.exit_code}）`,
+          r.exit_code === 0 ? "ok" : "err");
+      }
       loadResult();
       return;
     }
@@ -251,6 +265,18 @@ $("btn-cancel").addEventListener("click", async () => {
   if (!currentRunId) return;
   const r = await getJSON(`/api/run/${currentRunId}/cancel`, { method: "POST" });
   setStatus($("run-status"), r.note || "已请求取消", "");
+});
+
+$("btn-release").addEventListener("click", async () => {
+  const r = await getJSON("/api/run/release", { method: "POST" });
+  if (!r.ok) {
+    setStatus($("run-status"), "释放失败：" + (r.error || ""), "err");
+    return;
+  }
+  $("btn-release").style.display = "none";
+  $("btn-run").disabled = !hasUploaded;
+  $("btn-clear").disabled = false;
+  setStatus($("run-status"), r.note || "已释放运行槽位", "ok");
 });
 
 init();

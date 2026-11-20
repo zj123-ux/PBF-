@@ -68,3 +68,13 @@ def should_hold_slot(state: dict, proc_alive: bool, excel_running: bool) -> bool
     if state.get("timed_out") or state.get("cancelled"):
         return excel_running
     return False
+
+
+def can_force_release(state: dict, proc_alive: bool) -> bool:
+    """是否允许人工强制释放槽位。
+
+    只放行"运行已结束、被标记 stuck、子进程确已退出"的状态；仍在运行的
+    子进程一律拒绝，避免人工操作放行后两个流程同时操作 Excel。
+    用户点击前需自行确认 Excel 中没有仍在执行的宏。
+    """
+    return bool(state.get("done") and state.get("stuck")) and not proc_alive
