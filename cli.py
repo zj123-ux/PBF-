@@ -21,6 +21,7 @@ Usage:
   python cli.py run-flow --from-step 4    # 从第 4 步（其他成本）开始，前面 3 步跳过
   python cli.py run-flow --unit 乐华·电视 # 指定业务单元（品牌×品类），覆盖导航行
   python cli.py units                      # 列出/校验品牌×品类配置
+  python cli.py nav-scan --unit 乐华·电视  # 换账号后只读核对导航行 AA/AB/AC
 """
 from __future__ import annotations
 
@@ -39,8 +40,10 @@ import yaml
 
 from engine import (ExcelEngine, ExcelError, FormWriter, Navigator, RunPackageRunner,
                     FormReader, FormScanner, ensure_excel_ready, run_flow)
-from engine.business_units import (UnitError, apply_unit, check_units,
-                                   csv_dimension_warnings, default_unit)
+from engine.business_units import (NavRowError, UnitError, apply_form_overrides,
+                                   apply_unit, check_units, csv_dimension_warnings,
+                                   default_unit, nav_rows_from_grid,
+                                   resolve_nav_row)
 from engine.cancel import CancelledError, set_cancel_file_from_env
 from engine.orchestrator import close_form_workbooks_on_cancel
 from engine.clear import FORM_SCHEMA, clear_data
@@ -48,7 +51,9 @@ from engine.config_check import (Issue, check_flow, check_form_config,
                                  resolve_from_step)
 from engine.periods import parse_periods
 from engine.template_export import export_template
-from data_dirs import (latest_data_dir as find_latest_data_dir,
+from data_dirs import (data_dir_name, data_dir_unit,
+                       latest_data_dir as find_latest_data_dir,
+                       latest_data_dir_for as find_latest_data_dir_for,
                        list_data_dirs as find_data_dirs,
                        unrecognized_data_dirs as find_unrecognized_data_dirs)
 from paths import app_root
@@ -422,9 +427,14 @@ def cmd_scan(args) -> None:
                       "months": len(info["month_columns"]), "rows": info["input_rows"]})
 
 
+def configured_unit_names() -> list[str]:
+    """配置里的业务单元名（含未启用），用于识别 data_*_<单元> 目录后缀。"""
+    return list((load_units_config().get("units") or {}).keys())
+
+
 def latest_data_dir() -> Path:
     """默认数据目录：按期间取最新（排除 *_clear）；没有则报错提示先导出数据。"""
-    latest = find_latest_data_dir(ROOT)
+    latest = find_latest_data_dir(ROOT, configured_unit_names())
     if latest is None:
         raise SystemExit(
             "未找到任何 data_* 数据目录。请先导出上传数据：\n"
@@ -433,43 +443,89 @@ def latest_data_dir() -> Path:
     return latest
 
 
+def data_dir_for_unit(unit: str) -> Path:
+    """指定业务单元的数据目录（data_*_<单元>）。
+
+    没有该单元的专用目录时，仅当旧版无后缀目录只有一份才回退使用（并提示）；
+    存在多份旧目录则拒绝猜测，避免把别的单元/期间的数据写进 BPC。
+    """
+    names = configured_unit_names()
+    found = find_latest_data_dir_for(ROOT, unit, names)
+    if found is not None:
+        return found
+    legacy = [d for d in find_data_dirs(ROOT, names) if data_dir_unit(d.name) is None]
+    if len(legacy) == 1:
+        print(f"[提示] 没有 {unit} 的专用数据目录，使用旧版目录 {legacy[0].name}"
+              "（旧版目录不区分业务单元，请确认里面是该单元的数据；"
+              "建议重新上传模板生成专用目录）")
+        return legacy[0]
+    if legacy:
+        names_txt = "、".join(d.name for d in legacy)
+        raise SystemExit(f"未找到 {unit} 的专用数据目录 data_*_{unit}，"
+                         f"且存在多个旧版目录：{names_txt}。请用 --data-dir 指定。")
+    raise SystemExit(f"未找到 {unit} 的数据目录。请先上传/导出该单元的数据：\n"
+                     f"  python cli.py export --template 滚动预测模板表.xlsx "
+                     f"--periods 2026.11-2026.12 --unit {unit}")
+
+
 def existing_data_dirs() -> list[Path]:
     """所有已存在的上传数据目录（按期间升序，排除 *_clear 清除目录）。"""
-    return find_data_dirs(ROOT)
+    return find_data_dirs(ROOT, configured_unit_names())
 
 
 def warn_unrecognized_data_dirs() -> None:
     """data_ 前缀但不符合命名规则的目录不参与数据源选择，遇到时提示一句。"""
-    ignored = find_unrecognized_data_dirs(ROOT)
+    ignored = find_unrecognized_data_dirs(ROOT, configured_unit_names())
     if ignored:
         names = "、".join(p.name for p in ignored)
         print(f"[提示] 以下 data_ 开头的目录不符合命名规则 data_YYYY.MM"
-              f"（或 data_YYYY.MM_YYYY.MM），未当作数据源：{names}")
+              f"（或 data_YYYY.MM_YYYY.MM[_单元]），未当作数据源：{names}")
 
 
-def default_export_dir(periods: list[str]) -> Path:
-    """导出目录：单期间 data_YYYY.MM，多期间 data_<首>_<末>。"""
-    first, last = periods[0], periods[-1]
-    name = f"data_{first}" if first == last else f"data_{first}_{last}"
-    return ROOT / name
+def default_export_dir(periods: list[str], unit: str = "") -> Path:
+    """导出目录：data_<首>[_<末>][_<单元>]。"""
+    return ROOT / data_dir_name(periods, unit)
 
 
-def clear_out_dir(periods: list[str]) -> Path:
-    """清除目录：data_YYYY.MM_clear 或 data_<首>_<末>_clear。"""
-    first, last = periods[0], periods[-1]
-    rng = first if first == last else f"{first}_{last}"
-    return ROOT / f"data_{rng}_clear"
+def clear_out_dir(periods: list[str], unit: str = "") -> Path:
+    """清除目录：数据目录名后加 _clear（data_<首>[_<末>][_<单元>]_clear）。"""
+    return ROOT / (data_dir_name(periods, unit) + "_clear")
+
+
+def clear_source_dirs(unit: str = "") -> list[Path]:
+    """clear 的数据来源目录。
+
+    指定单元时只取该单元的专用目录（不把别的单元数据带进本次清 0）；
+    该单元还没有专用目录时，仅当旧版无后缀目录唯一才回退，多份则拒绝猜测。
+    """
+    all_dirs = existing_data_dirs()
+    if not unit:
+        return all_dirs
+    own = [d for d in all_dirs if data_dir_unit(d.name) == unit]
+    if own:
+        return own
+    legacy = [d for d in all_dirs if data_dir_unit(d.name) is None]
+    if len(legacy) == 1:
+        print(f"[提示] 没有 {unit} 的专用数据目录，改用旧版目录 {legacy[0].name}"
+              "（旧版目录不区分业务单元，请确认里面是该单元的数据）")
+        return legacy
+    raise SystemExit(f"未找到 {unit} 的数据目录（data_*_{unit}）。"
+                     "请先上传/导出该单元的数据。")
 
 
 def cmd_export(args) -> None:
     """从《滚动预测模板表.xlsx》导出 1–6 个期间的上传数据。"""
     periods = parse_periods(args.periods)
+    unit = (getattr(args, "unit", None) or "").strip()
+    if unit and unit not in configured_unit_names():
+        raise SystemExit(f"未知业务单元: {unit}（见 python cli.py units）")
     template = Path(args.template)
-    out_dir = Path(args.out_dir) if args.out_dir else default_export_dir(periods)
+    out_dir = Path(args.out_dir) if args.out_dir else default_export_dir(periods, unit)
 
     print(f"\n=== export ===")
     print(f"模板: {template}")
     print(f"期间: {', '.join(periods)}")
+    print(f"业务单元: {unit or '(未指定，旧版目录名)'}")
     print(f"输出: {out_dir}")
     rows = export_template(template, periods, out_dir, zero=args.zero)
     print("\n[导出结果]")
@@ -487,11 +543,18 @@ def cmd_clear(args) -> None:
     """批量清除：把既有 data_* 目录里填过的数字清成 0，期间可自由选择。"""
     warn_unrecognized_data_dirs()
     periods = parse_periods(args.periods)
-    data_dirs = [Path(d) for d in args.data_dirs] if args.data_dirs else existing_data_dirs()
-    out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else clear_out_dir(periods)
+    unit = (getattr(args, "unit", None) or "").strip()
+    if unit and unit not in configured_unit_names():
+        raise SystemExit(f"未知业务单元: {unit}（见 python cli.py units）")
+    data_dirs = ([Path(d) for d in args.data_dirs] if args.data_dirs
+                 else clear_source_dirs(unit))
+    out_dir = (Path(args.out_dir) if getattr(args, "out_dir", None)
+               else clear_out_dir(periods, unit))
 
     print(f"\n=== clear ===")
     print(f"清除期间: {', '.join(periods)}")
+    if unit:
+        print(f"业务单元: {unit}")
     print(f"数据来源: {', '.join(d.name for d in data_dirs)}")
     print(f"输出: {out_dir}")
     try:
@@ -577,11 +640,117 @@ def cmd_units(args) -> None:
     for name, unit in units_cfg["units"].items():
         unit = unit or {}
         mark = "✓ 启用" if unit.get("启用") else "  未配置"
-        print(f"  {mark}  {name}  （{unit.get('品牌', '')}·{unit.get('品类', '')}）")
+        extra = ""
+        skipped = unit.get("跳过步骤") or []
+        if skipped:
+            extra += f"  跳过: {', '.join(map(str, skipped))}"
+        overrides = unit.get("表单覆盖") or {}
+        if isinstance(overrides, dict) and overrides:
+            extra += f"  覆盖: {', '.join(map(str, overrides))}"
+        print(f"  {mark}  {name}  （{unit.get('品牌', '')}·{unit.get('品类', '')}）{extra}")
     issues = check_units(units_cfg, flow_cfg)
     print(f"\n校验: {'通过' if not issues else f'{len(issues)} 项问题'}")
     for issue in issues:
         print(f"  {issue}")
+
+
+def _norm_expect(value) -> list[str]:
+    """标签关键字列表归一化（与 business_units 内部规则一致）。"""
+    if not isinstance(value, list):
+        return []
+    return [str(x).strip() for x in value if str(x).strip()]
+
+
+def cmd_nav_scan(args) -> None:
+    """只读扫描导航表 AA/AB/AC，核对单元配置的导航行。
+
+    换账号/换权限后使用：导航表按账号权限生成，行号可能整体移动。
+    本命令只读单元格，不选中任何行、不触发 SelectionChange、不打开表单。
+    """
+    base_flow = load_yaml(ROOT / "config" / "flow.yaml")
+    units_cfg = load_units_config()
+    requested = (getattr(args, "unit", None) or "").strip()
+    unit_name = requested or default_unit(units_cfg) or ""
+    if unit_name:
+        try:
+            flow_cfg = apply_unit(base_flow, units_cfg, unit_name)
+        except UnitError as exc:
+            raise SystemExit(f"业务单元配置错误: {exc}")
+        print(f"\n业务单元: {unit_name}")
+        skipped = (flow_cfg.get("_unit") or {}).get("skipped_steps") or []
+        if skipped:
+            print(f"跳过步骤: {', '.join(skipped)}")
+        for issue in check_units(units_cfg, base_flow, only=unit_name):
+            print(f"[业务单元] {issue}")
+    else:
+        flow_cfg = base_flow
+        print("\n业务单元: 未配置（只扫描导航表，不核对单元行）")
+
+    nav = flow_cfg["navigator"]
+    engine = ExcelEngine()
+    wb = engine.get_workbook(nav["workbook_pattern"], wait_sec=10)
+    ws = engine.open_sheet(wb, nav["sheet"])
+    rng = str(nav.get("locate_scan_range") or "AA1:AC200")
+    vals = engine._retry(lambda: ws.Range(rng).Value2, attempts=5, delay=1)
+    start = int("".join(ch for ch in rng.split(":")[0] if ch.isdigit()) or 1)
+    rows = nav_rows_from_grid(vals, start)
+    by_row = {r["row"]: r for r in rows}
+
+    print(f"\n[导航表扫描（只读，未选中任何行）] {wb.Name}")
+    print(f"扫描范围 {rng}，非空行 {len(rows)}")
+    print("\n  行   AA(业务模块) / AB(流程步骤) / AC(业务单元)")
+    for r in rows:
+        print(f"  {r['row']:>4}  {r['label']}")
+
+    unit = flow_cfg.get("_unit") or {}
+    default_expect = _norm_expect(unit.get("nav_expect"))
+    targets: list[tuple[str, str, list[str]]] = []
+    for i, step in enumerate(flow_cfg.get("steps") or [], 1):
+        targets.append((f"步骤 {i} 填表 {step.get('form')}",
+                        str(step.get("nav_cell") or ""),
+                        _norm_expect(step.get("nav_expect")) or default_expect))
+        after = step.get("after_close") or {}
+        if after.get("nav_cell"):
+            targets.append((f"步骤 {i} 运行包 {step.get('form')}",
+                            str(after["nav_cell"]),
+                            _norm_expect(after.get("nav_expect")) or default_expect))
+    verify = flow_cfg.get("verify") or {}
+    if verify.get("nav_cell"):
+        targets.append(("损益核对", str(verify["nav_cell"]),
+                        _norm_expect(verify.get("nav_expect")) or default_expect))
+
+    failures = 0
+    print("\n[配置核对]")
+    for label, cell, expect in targets:
+        if not cell:
+            print(f"  ✗ {label}: 未配置 nav_cell")
+            failures += 1
+            continue
+        if not expect:
+            print(f"  ! {label}: {cell} 未配置 nav_expect，无法按内容核对")
+            continue
+        try:
+            located, mode = resolve_nav_row(rows, cell, expect)
+        except NavRowError as exc:
+            print(f"  ✗ {label}: {cell} 定位失败 — {exc}")
+            failures += 1
+            continue
+        if mode == "ambiguous":
+            print(f"  ! {label}: 配置 {cell}（关键字 {expect} 匹配多行，"
+                  "沿用配置行；建议补 AB 关键字）")
+        elif located != cell:
+            hit = by_row.get(int("".join(ch for ch in located if ch.isdigit())))
+            detail = f"「{hit['label']}」" if hit else ""
+            print(f"  ! {label}: 配置 {cell} → 实际 {located} {detail}"
+                  "（行号已移动，建议更新 nav_cell）")
+        else:
+            print(f"  ✓ {label}: {cell}")
+
+    print(f"\n结果: {'全部可定位' if not failures else f'{failures} 项无法定位'}")
+    audit_log("nav-scan", {"unit": unit_name, "rows": len(rows),
+                           "failures": failures})
+    if failures:
+        sys.exit(1)
 
 
 def write_report_file(args, report: dict) -> None:
@@ -610,7 +779,9 @@ def cmd_run_flow(args) -> None:
             raise SystemExit(f"业务单元配置错误: {exc}")
         unit = flow_cfg["_unit"]
         note = "" if requested else "（未指定 --unit，默认第一个启用单元）"
-        print(f"业务单元: {unit_name}（{unit['brand']}·{unit['category']}）{note}")
+        skipped = unit.get("skipped_steps") or []
+        skip_note = f" | 跳过步骤: {', '.join(skipped)}" if skipped else ""
+        print(f"业务单元: {unit_name}（{unit['brand']}·{unit['category']}）{note}{skip_note}")
     elif units_cfg.get("units"):
         # 配置了单元却没有任何启用：拒绝静默跑 flow.yaml 写死行（与 webapp 行为一致）
         raise SystemExit(
@@ -627,7 +798,21 @@ def cmd_run_flow(args) -> None:
             print(f"[业务单元] {issue}")
 
     form_cfgs = {s["form"]: load_form_config(s["form"]) for s in flow_cfg["steps"]}
-    data_dir = Path(args.data_dir) if args.data_dir else latest_data_dir()
+    if unit_name:
+        # 单元级表单覆盖（如 TCL商用 不编制加权CT）只影响本次运行的表单配置副本
+        try:
+            form_cfgs = apply_form_overrides(form_cfgs, units_cfg, unit_name)
+        except UnitError as exc:
+            raise SystemExit(f"业务单元配置错误: {exc}")
+    if args.data_dir:
+        data_dir = Path(args.data_dir)
+    elif unit_name:
+        data_dir = data_dir_for_unit(unit_name)
+    else:
+        data_dir = latest_data_dir()
+    if unit_name and data_dir_unit(data_dir.name) not in (None, unit_name):
+        print(f"[警告] 数据目录 {data_dir.name} 属于另一个业务单元，"
+              f"本次按 {unit_name} 运行；请确认不是选错目录")
 
     print(f"\n=== run-flow ===")
     print(f"数据目录: {data_dir}")
@@ -821,7 +1006,8 @@ def build_parser() -> argparse.ArgumentParser:
     vd.add_argument("--config-only", action="store_true", help="只校验配置，不检查数据文件")
 
     rf = sub.add_parser("run-flow", help="按业务顺序跑完整流程（填表→计算→运行包→核对）")
-    rf.add_argument("--data-dir", help="数据目录，默认取最新的 data_YYYY.MM")
+    rf.add_argument("--data-dir",
+                    help="数据目录，默认取该业务单元最新的 data_*_<单元>（无则回退唯一的旧版目录）")
     rf.add_argument("--skip-fill", action="store_true", help="跳过填表，只跑计算/运行包/核对")
     rf.add_argument("--only-verify", action="store_true", help="只做版本确认+损益核对")
     rf.add_argument("--from-step",
@@ -841,21 +1027,27 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--template", required=True, help="滚动预测模板表 .xlsx 路径")
     ex.add_argument("--periods", required=True,
                     help="期间，支持单值/列表/区间，如 2027.01 或 2027.01,2027.03 或 2027.01-2027.04")
-    ex.add_argument("--out-dir", help="输出目录，默认 data_<首>_<末>")
+    ex.add_argument("--out-dir", help="输出目录，默认 data_<首>_<末>[_单元]")
+    ex.add_argument("--unit", help="业务单元（品牌×品类），写入目录名，如 乐华·电视")
     ex.add_argument("--zero", action="store_true", help="所有数值填 0（导出清零数据）")
 
     cl = sub.add_parser("clear", help="批量清除：把既有 data_* 目录里填过的数字清成 0")
     cl.add_argument("--periods", required=True, help="要清除的期间，支持单值/列表/区间")
     cl.add_argument("--data-dirs", nargs="*", help="数据来源目录，默认全部既有 data_*")
-    cl.add_argument("--out-dir", help="输出目录，默认 data_<首>_<末>_clear")
+    cl.add_argument("--out-dir", help="输出目录，默认 data_<首>_<末>[_单元]_clear")
     cl.add_argument("--run", action="store_true", help="生成后接着运行 run-flow 填 0")
-    cl.add_argument("--unit", help="业务单元（品牌×品类），配合 --run 使用")
+    cl.add_argument("--unit",
+                    help="业务单元（品牌×品类）：只清该单元的数据目录，输出目录带单元名")
     cl.add_argument("--version", help="run-flow 期望版本子串（配合 --run）")
     cl.add_argument("--version-key",
                     help="run-flow 切换的版本成员键，如 C03202611V2（配合 --run）")
     cl.add_argument("--report-file", help="run-flow 结果 JSON 路径（配合 --run）")
 
     un = sub.add_parser("units", help="列出并校验业务单元（品牌×品类）配置")
+
+    ns = sub.add_parser("nav-scan",
+                        help="只读扫描导航表 AA/AB/AC，核对业务单元导航行（换账号后用）")
+    ns.add_argument("--unit", help="业务单元，如 乐华·电视；默认第一个启用单元")
 
     return p
 
@@ -880,6 +1072,7 @@ def main() -> None:
          "clear": cmd_clear,
          "validate": cmd_validate,
          "units": cmd_units,
+         "nav-scan": cmd_nav_scan,
          "run-flow": cmd_run_flow}[args.cmd](args)
     except ExcelError as exc:
         print(f"\n[ExcelError] {exc}", file=sys.stderr)

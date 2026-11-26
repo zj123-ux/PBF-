@@ -22,6 +22,7 @@ from typing import Any, Optional
 import pandas as pd
 import yaml
 
+from .business_units import (NavRowError, nav_rows_from_grid, resolve_nav_row)
 from .excel import ExcelEngine, ExcelError, is_disconnect
 from .bootstrap import ensure_excel_ready, launch_no_box_ok_sec, wait_ao_login_idle
 from .cancel import CancelledError, is_cancelled, raise_if_cancelled
@@ -163,7 +164,8 @@ def _package_items(packages) -> list[tuple[int, str]]:
 
 class PbfFlow:
     def __init__(self, engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Path,
-                 persist_panel_cache: bool = False) -> None:
+                 persist_panel_cache: bool = False,
+                 user_key: Optional[str] = None) -> None:
         self.engine = engine
         self.cfg = flow_cfg
         self.nav_cfg = flow_cfg["navigator"]
@@ -182,6 +184,15 @@ class PbfFlow:
         self._panel_cache_file = app_root() / "logs" / "nav_panel_cache.json"
         if persist_panel_cache:
             self._load_panel_cache()
+        # 面板指纹缓存按账号隔离：换账号登录时导航表按权限重新生成，行号可能
+        # 整体移动；上一个账号验证过的指纹不能当作当前账号的正确状态。
+        # user_key 仅用于测试注入；正常运行取配置/env 里的登录用户名。
+        self.login_user = (str(user_key).strip() if user_key is not None
+                           else str(login_config(flow_cfg).get("username") or "").strip())
+        # 导航标签日志去重（同一格每轮只提示一次）
+        self._nav_label_logged: set[str] = set()
+        self._nav_label_warned: set[str] = set()
+        self._nav_ambiguous_warned: set[str] = set()
         # 每张表单打开后要核对的版本（由 run_flow 根据 --version-key/--version 设置）
         self.form_version_key: Optional[str] = None
         self.form_version_display: Optional[str] = None
@@ -523,9 +534,14 @@ class PbfFlow:
         return "|".join(flat)
 
     def _panel_cache_key(self, nav_cell: str) -> str:
-        """面板指纹按「版本|业务单元」区分：不同版本的步骤清单可能不同。"""
+        """面板指纹按「账号|版本|导航格」区分。
+
+        - 账号不同：导航表按权限重新生成，行号可能整体移动，缓存不能跨账号复用；
+        - 版本不同：步骤清单可能不同。
+        """
         ver = self.form_version_display or self.form_version_key or ""
-        return f"{ver}|{nav_cell}"
+        user = self.login_user or "-"
+        return f"{user}|{ver}|{nav_cell}"
 
     def _load_panel_cache(self) -> None:
         try:
@@ -550,13 +566,145 @@ class PbfFlow:
         except Exception as exc:
             log.debug(f"保存面板缓存失败（忽略）: {exc}")
 
-    def _select_nav_cell(self, ws, nav_cell: str) -> None:
-        """选中业务单元行。
+    def _cell_text(self, ws, addr: str) -> str:
+        """读取单元格文本；合并单元格取左上角，读不到返回空串。"""
+        if not addr:
+            return ""
+
+        def _read():
+            rng = ws.Range(addr)
+            try:
+                v = rng.MergeArea.Cells(1, 1).Value2
+            except Exception:
+                v = rng.Value2
+            if isinstance(v, tuple) and len(v) == 1 and isinstance(v[0], tuple):
+                v = v[0][0]
+            return str(v or "").strip()
+        try:
+            return self.engine._retry(_read, attempts=5, delay=1)
+        except Exception as exc:
+            log.warning(f"读取导航标签 {addr} 失败: {exc}")
+            return ""
+
+    def _nav_label(self, ws, nav_cell: str) -> str:
+        """导航行身份标签：AA(业务模块) + AB(流程步骤) + AC(业务单元)。
+
+        人工判断表单位置就是看这三列：AC 相同的行（如 AC65/AC67 都是
+        「CBG-智屏-乐华品牌」）必须靠 AB 的「编制/查询」区分，所以三者缺一不可。
+        """
+        row = "".join(ch for ch in nav_cell if ch.isdigit())
+        if not row:
+            return self._cell_text(ws, nav_cell)
+        parts = [
+            self._cell_text(ws, f"AA{row}"),
+            self._cell_text(ws, f"AB{row}"),
+            self._cell_text(ws, nav_cell),
+        ]
+        return " | ".join(p for p in dict.fromkeys(parts) if p)
+
+    def _expect_labels(self, expect_labels: Optional[list[str]]) -> list[str]:
+        """归一化标签关键字；None = 用单元级 nav_expect。"""
+        if expect_labels is None:
+            expect_labels = (self.cfg.get("_unit") or {}).get("nav_expect") or []
+        return [str(x).strip() for x in expect_labels if str(x).strip()]
+
+    def _nav_scan_range(self) -> str:
+        return str(self.nav_cfg.get("locate_scan_range") or "AA1:AC200")
+
+    def _nav_grid(self, ws) -> list[dict]:
+        """批量只读扫描导航表 AA:AC，返回可定位的行。
+
+        读失败时返回空列表：调用方退回固定行，单格标签校验仍是最后一道防线。
+        """
+        rng = self._nav_scan_range()
+        try:
+            vals = self.engine._retry(lambda: ws.Range(rng).Value2,
+                                      attempts=5, delay=1)
+        except Exception as exc:
+            log.warning(f"读取导航表 {rng} 失败，改用固定行定位：{exc}")
+            return []
+        start = int("".join(ch for ch in rng.split(":")[0] if ch.isdigit()) or 1)
+        return nav_rows_from_grid(vals, start)
+
+    def _resolve_nav_cell(self, ws, nav_cell: str,
+                          expect_labels: Optional[list[str]]) -> str:
+        """按 AA+AB+AC 标签内容定位实际导航格（换账号行号移动也能对上）。
+
+        - 唯一命中 → 用命中行；
+        - 多行命中且配置行在其中 → 沿用配置行并告警（与只有单格校验时一致）；
+        - 零命中 / 多行命中但配置行不在其中 → 中止，不选中、不打开任何表单。
+        """
+        if not bool(self.nav_cfg.get("locate_by_label", True)):
+            return nav_cell
+        expect = self._expect_labels(expect_labels)
+        if not expect:
+            return nav_cell
+        rows = self._nav_grid(ws)
+        if not rows:
+            return nav_cell
+        try:
+            cell, mode = resolve_nav_row(rows, nav_cell, expect)
+        except NavRowError as exc:
+            label = self._nav_label(ws, nav_cell)
+            raise ExcelError(
+                f"{nav_cell} 按标签定位失败：{exc}。"
+                f"配置行当前标签是「{label or '空'}」。"
+                "当前账号的导航表布局可能与配置不一致，已中止，"
+                "未选中任何行、未打开任何表单。请用该账号核对 "
+                "config/business_units.yaml 的 nav_cell / nav_expect"
+                "（可先运行 python cli.py nav-scan --unit <单元> 查看）")
+        if mode == "unique" and cell != nav_cell:
+            log.warning(
+                f"导航行按标签定位：配置 {nav_cell} → 实际 {cell}"
+                f"（标签「{self._nav_label(ws, cell)}」）。"
+                "请核对配置：换账号后行号可能整体移动，"
+                "也可能是 nav_expect 指向了另一行")
+        elif mode == "ambiguous" and nav_cell not in self._nav_ambiguous_warned:
+            self._nav_ambiguous_warned.add(nav_cell)
+            log.warning(
+                f"{nav_cell} 的标签关键字 {expect} 匹配多行，沿用配置行；"
+                "建议补 AB 关键字（如「编制」「查询」）以便按内容唯一定位")
+        return cell
+
+    def _check_nav_label(self, ws, nav_cell: str,
+                         expect_labels: Optional[list[str]]) -> None:
+        """选中前核对导航行标签，防止账号权限不同导致固定行指向别的单元。
+
+        只做读取，不选中、不触发 SelectionChange——标签不对时零副作用中止。
+        未配置关键字时只告警一次（兼容旧配置，但等于放弃了这层保护）。
+        """
+        expect = [str(x).strip() for x in (expect_labels or []) if str(x).strip()]
+        if not expect:
+            if nav_cell not in self._nav_label_warned:
+                self._nav_label_warned.add(nav_cell)
+                log.warning(
+                    f"未配置 nav_expect，跳过 {nav_cell} 的导航标签校验——"
+                    "换账号后导航行错位将无法发现")
+            return
+        label = self._nav_label(ws, nav_cell)
+        missing = [k for k in expect if k not in label]
+        if missing:
+            raise ExcelError(
+                f"导航行 {nav_cell} 的标签（AA+AB+AC）是「{label or '空'}」，"
+                f"未包含 {missing}。"
+                "当前账号的导航表布局可能与配置不一致（不同权限的行会整体移动），"
+                "已中止，未打开任何表单。请用该账号核对 config/business_units.yaml "
+                "的 nav_cell / nav_expect")
+        if nav_cell not in self._nav_label_logged:
+            self._nav_label_logged.add(nav_cell)
+            log.info(f"{nav_cell} 标签校验通过：{label}")
+
+    def _select_nav_cell(self, ws, nav_cell: str,
+                         expect_labels: Optional[list[str]] = None) -> None:
+        """选中业务单元行（先核对标签）。
 
         SelectionChange 只在选中格**变化**时触发；重试时若仍选着同一格，
         面板不会再刷新（这也是 AT52 点下去没反应的原因之一）。先点 A1
         强制一次变化，再选目标格。
         """
+        if expect_labels is None:
+            expect_labels = (self.cfg.get("_unit") or {}).get("nav_expect")
+        self._check_nav_label(ws, nav_cell, expect_labels)
         try:
             ws.Range("A1").Select()
         except Exception:
@@ -568,6 +716,46 @@ class PbfFlow:
         row = "".join(ch for ch in btn if ch.isdigit())
         return str(self._read(ws, f"AR{row}") or "").strip() if row else ""
 
+    def _static_panel_acceptable(self, ws, nav_cell: str, want: Optional[str],
+                                 row_type: str) -> bool:
+        """面板内容没变化时，判断它是否本来就该停在这一行。
+
+        不同导航行可以共用同一套流程步骤模板——现场实测「CBG-商用」与
+        「CBG-乐华」的 CBG损益查询流程返回同一个步骤模板，选中后步骤面板
+        内容一字不差。此时"面板必须变化"的判定会误报会话失效（复核时
+        Refresh_Status 仍能正常刷新，会话其实活着）。
+
+        导航表自己的 Worksheet_SelectionChange 会把本次选中行写进 B4
+        （「本次选择行数」），且写在任何 AO 调用之前——读它就能确认这次
+        选中确实被导航表处理过，再按行类型接受静止面板。B4 不可读时退回
+        原来的行类型放行，兼容没有该单元格的导航表。
+        """
+        if want:
+            if not row_type or row_type != want:
+                return False
+        elif row_type not in ("表单", "运行包"):
+            return False
+        try:
+            raw = self._read(ws, "B4")
+        except Exception:
+            raw = None
+        if raw in (None, ""):
+            log.info(f"{nav_cell} 面板内容未变化，导航表 B4 不可读，按行类型「{row_type}」接受")
+            return True
+        try:
+            selected = int(float(raw))
+        except (TypeError, ValueError):
+            log.info(f"{nav_cell} 面板内容未变化，B4={raw!r} 不是行号，按行类型「{row_type}」接受")
+            return True
+        target = int("".join(ch for ch in nav_cell if ch.isdigit()) or 0)
+        if target and selected == target:
+            log.info(f"{nav_cell} 面板内容与上一行相同（共用流程模板），"
+                     f"B4={selected} 确认本次选中已被导航表处理，按行类型「{row_type}」接受")
+            return True
+        log.warning(f"{nav_cell} 面板内容未变化，但导航表 B4={selected} 不是本次选中行"
+                    f"（{target}）——选中可能未生效或会话异常，不能按静止面板接受")
+        return False
+
     def _wait_panel_refresh(self, ws, nav_cell: str, btn: str,
                             before: str, timeout_sec: float,
                             want: Optional[str] = None,
@@ -578,8 +766,9 @@ class PbfFlow:
         上一次运行可能刚好把面板停在这一行，选中前后内容一致属正常。
 
         accept_static：无缓存时（新进程冷启动），刷新流程已成功过一轮之后，
-        面板内容没变也可接受——前提是按钮行的行类型与 want 一致。不然会把
-        "面板本来就停在目标行"误判成会话失效，白重启一次 Excel。
+        面板内容没变也可接受——要求按钮行行类型匹配，且导航表 B4 记录的
+        本次选中行就是目标行（见 _static_panel_acceptable）。否则会把
+        "面板本来就停在目标行"或"两行共用同一流程模板"误判成会话失效。
         """
         deadline = time.time() + max(float(timeout_sec), 1.0)
         cached = self._panel_cache.get(self._panel_cache_key(nav_cell))
@@ -598,22 +787,30 @@ class PbfFlow:
                     return True, btn_text, False
                 if cached is not None and now == cached:
                     return True, btn_text, True
-                if accept_static and want and row_type == want:
+                if accept_static and self._static_panel_acceptable(
+                        ws, nav_cell, want, row_type):
                     return True, btn_text, True
         return False, btn_text, False
 
     def open_via_nav(self, nav_cell: str, open_cell: Optional[str] = None,
                      expect: str = "form", wait_sec: Optional[int] = None,
-                     pattern: Optional[str] = None) -> str:
+                     pattern: Optional[str] = None,
+                     expect_labels: Optional[list[str]] = None) -> str:
         """选中业务单元行 → 等面板刷新 → 点"打开" → 返回新打开的工作簿名。
 
         expect: 'form' 期望打开编制表；'package' 期望打开运行包清单。
         pattern: 编制表的 workbook_pattern（有些表单名里没有"编制"二字，只能按模式匹配）。
+        expect_labels: 导航行标签必须包含的关键字；None = 用单元级 nav_expect。
         """
         wb = self._nav_wb()
         ws = self.engine.open_sheet(wb, self.nav_cfg["sheet"])
         btn = open_cell or self.nav_cfg["open_button_cell"]
         panel_wait = float(self.nav_cfg.get("panel_wait_sec") or 15)
+
+        # 先按标签内容定位实际行（只读），再进行选中/面板刷新。
+        # 定位失败会在选中前中止，保证零副作用。
+        expect_labels = self._expect_labels(expect_labels)
+        nav_cell = self._resolve_nav_cell(ws, nav_cell, expect_labels)
 
         # "打开"靠导航表的 SelectionChange 触发，偶尔会被 Excel/AO 忙吞掉，因此重试几轮
         want = {"form": "表单", "package": "运行包"}.get(expect)
@@ -624,7 +821,7 @@ class PbfFlow:
             before = set(self.engine._retry(
                 lambda: self.engine.workbook_names(), attempts=5, delay=2))
             before_panel = self._panel_fingerprint()
-            self._select_nav_cell(ws, nav_cell)
+            self._select_nav_cell(ws, nav_cell, expect_labels)
             # 第 1 轮不允许"面板没动就算刷新过"——那可能真是会话死了，
             # 交给下面的刷新流程去分辨；刷新成功过一轮后才接受静止面板。
             fresh, btn_text, via_cache = self._wait_panel_refresh(
@@ -632,9 +829,12 @@ class PbfFlow:
                 want=want, accept_static=attempt > 1)
 
             if not fresh:
+                # 内容没变不一定是会话失效：商用/乐华等共用同一流程模板的行，
+                # 选中后步骤面板本来就一字不差（B4 会确认选中已生效）。先刷新流程，
+                # 刷新成功后再按 B4/行类型判断，避免每轮第一次核对都误报过期。
                 log.warning(
-                    f"选中 {nav_cell} 后步骤面板未刷新（{btn}='{btn_text}'），"
-                    "疑似 AO/BPC 会话已失效")
+                    f"选中 {nav_cell} 后步骤面板内容未变化（{btn}='{btn_text}'），"
+                    "可能该行与上一行共用同一流程模板；先刷新流程确认会话状态")
                 if attempt == 1:
                     # 先走工具自带的「刷新流程」：它正好能区分瞬时忙和会话过期
                     try:
@@ -729,7 +929,7 @@ class PbfFlow:
 
         self._close_if_open(pattern)
         self.open_via_nav(step["nav_cell"], self.nav_cfg["open_button_cell"], "form",
-                          pattern=pattern)
+                          pattern=pattern, expect_labels=step.get("nav_expect"))
         self.engine.get_workbook(pattern, wait_sec=30)
 
         # 锁定表单不要尝试切版本/写数据；命中后由 run_flow 跳过并结束流程
@@ -762,7 +962,8 @@ class PbfFlow:
         if cfg.get("verify_writeback") is False:
             enabled = False
         if enabled:
-            fails = self.verify_persisted(form_id, step["nav_cell"], res.get("cells") or {})
+            fails = self.verify_persisted(form_id, step["nav_cell"], res.get("cells") or {},
+                                          expect_labels=step.get("nav_expect"))
             res["verified"] = not fails
             if fails:
                 res.setdefault("failures", []).extend(f"落库校验 {f}" for f in fails[:5])
@@ -770,7 +971,8 @@ class PbfFlow:
                     res["failures"].append(f"落库校验失败共 {len(fails)} 格（仅列出前 5 格）")
         return res
 
-    def verify_persisted(self, form_id: str, nav_cell: str, cells: dict) -> list[str]:
+    def verify_persisted(self, form_id: str, nav_cell: str, cells: dict,
+                         expect_labels: Optional[list[str]] = None) -> list[str]:
         """关闭工作簿（不保存）→ 经导航表重开 → 读回比对，确认数据已落到 BPC。
 
         返回不一致项列表（空列表 = 全部通过）。可用 flow.yaml 的
@@ -790,7 +992,7 @@ class PbfFlow:
 
         self._close_if_open(pattern)
         self.open_via_nav(nav_cell, self.nav_cfg["open_button_cell"], "form",
-                          pattern=pattern)
+                          pattern=pattern, expect_labels=expect_labels)
         self.ensure_form_version(form_id)
         wb = self.engine.get_workbook(pattern, wait_sec=60)
         ws = self.engine.open_sheet(wb, cfg["sheet"])
@@ -822,7 +1024,7 @@ class PbfFlow:
 
         self._close_if_open(pattern)
         self.open_via_nav(step["nav_cell"], self.nav_cfg["open_button_cell"], "form",
-                          pattern=pattern)
+                          pattern=pattern, expect_labels=step.get("nav_expect"))
         self.engine.get_workbook(pattern, wait_sec=30)
 
         lock = FormWriter(self.engine, cfg).detect_lock()
@@ -861,17 +1063,20 @@ class PbfFlow:
         log.info(f"{form_id}: 执行 {macro} 完成（{int((time.time()-t0)*1000)}ms）")
         time.sleep(3)
 
-    def run_package(self, nav_cell: str, step_row: int, expected_name: str = "") -> dict:
+    def run_package(self, nav_cell: str, step_row: int, expected_name: str = "",
+                    expect_labels: Optional[list[str]] = None) -> dict:
         """打开运行包清单 → Execute → 轮询状态 → 关闭。
 
         expected_name：该行号期望的包名（flow.yaml after_close.packages 的
         「行号: 包名」写法）。步骤面板若停在别的同类型行上，会开到错误的
         包上下文——清单 AB73 的步骤名与期望对不上就中止，绝不执行错包。
+        expect_labels：导航行 AA+AB+AC 必须包含的关键字；None = 单元级默认。
         """
         self.ensure_navigator_version()
         self._close_if_open(self.pkg_cfg["workbook_pattern"])
         self.open_via_nav(nav_cell, open_cell=f"AT{step_row}",
-                          expect="package", wait_sec=20)
+                          expect="package", wait_sec=20,
+                          expect_labels=expect_labels)
 
         wb = self.engine.get_workbook(self.pkg_cfg["workbook_pattern"], wait_sec=30)
         ws = self.engine.open_sheet(wb, self.pkg_cfg["sheet"])
@@ -943,7 +1148,8 @@ class PbfFlow:
         self.ensure_navigator_version()
         self._close_if_open("YC_CBG损益查询表*")
         self.open_via_nav(vcfg["nav_cell"], open_cell=f"AT{vcfg['form_row']}",
-                          expect="any", wait_sec=20)
+                          expect="any", wait_sec=20,
+                          expect_labels=vcfg.get("nav_expect"))
         wb = self.engine.get_workbook("YC_CBG损益查询表*", wait_sec=30)
         ws = self.engine.open_sheet(wb, vcfg["sheet"])
 
@@ -1397,7 +1603,9 @@ def run_flow(engine: ExcelEngine, flow_cfg: dict, form_cfgs: dict, data_dir: Pat
         after_close = step.get("after_close") or {}
         if after_close:
             for row, expected in _package_items(after_close.get("packages")):
-                r = flow.run_package(after_close["nav_cell"], row, expected_name=expected)
+                r = flow.run_package(after_close["nav_cell"], row,
+                                     expected_name=expected,
+                                     expect_labels=after_close.get("nav_expect"))
                 report["packages"].append(r)
                 if not r["ok"]:
                     raise ExcelError(f"运行包未成功: {r}")

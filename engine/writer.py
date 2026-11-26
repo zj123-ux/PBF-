@@ -406,16 +406,26 @@ class FormWriter:
                     continue
             rows.append(r)
         self._last_data_row = last_data_row
-        if append and last_data_row is not None:
+        if append:
             # 2026-11-24 实测：在 AO 查询结果最后一行下方写入新维度组合，
             # Plan_Save 保存后关闭重开仍在（原以为会被查询丢弃，实际可以）。
-            row = last_data_row + 1
-            if (row <= end and row not in skip
-                    and all(_is_empty(self.engine.read(sheet, f"{c}{row}")) for c in cols)):
+            # 空白表（一条数据行都没有，如 TCL商用客户费用）没有锚点行，
+            # 从首个可写行开始追加——表头下方就是 AO 数据区首行。
+            # 连续空行都可以追加（多条新键各占一行），遇到宏参数行
+            # （skip_rows）或已有数据行即停，不能跨过去写。
+            row = (last_data_row + 1) if last_data_row is not None else start
+            first = row
+            while row <= end:
+                if row in skip or not all(
+                        _is_empty(self.engine.read(sheet, f"{c}{row}")) for c in cols):
+                    break
                 rows.append(row)
-                log.info(f"表尾追加行 {row}（最后数据行 {last_data_row}）")
+                row += 1
+            if rows:
+                whence = f"最后数据行 {last_data_row}" if last_data_row is not None else "空白表"
+                log.info(f"表尾追加行 {first}-{rows[-1]}（{whence}）")
             else:
-                log.warning(f"最后数据行 {last_data_row} 下方第 {row} 行不可追加")
+                log.warning(f"无可追加行：起点 {first} 已被占用、是参数行或超出可写范围")
         self._blank_rows = rows
         extra = f"，跳过格式不一致的模板残留行 {dropped} 行" if dropped else ""
         log.info(f"表单空白可新增行 {len(rows)} 行（{start}-{end}）{extra}")

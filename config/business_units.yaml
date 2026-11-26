@@ -6,6 +6,25 @@
 #   - 选中单元后，steps[].nav_cell 会覆盖 flow.yaml 里写死的导航行；
 #   - 可选：step.after_close_nav_cell（运行包导航行）、
 #           unit.verify_nav_cell / verify_form_row（损益核对位置）。
+#
+# 换账号注意：导航表是按登录账号的权限生成的，行号会随账号变化。固定 nav_cell
+# 一旦指到别的单元，会写错表。因此启用的单元必须配置 nav_expect：
+# 选中前读取该行 AA(业务模块) + AB(流程步骤) + AC(业务单元) 三列，标签必须
+# 包含全部关键字，否则零副作用中止（不选中、不打开表单）。
+# 注意 AC 相同的行靠 AB 区分——如 AC65「编制毛利之下费用」与 AC67
+# 「查询毛利之下费用」的 AC 都是「CBG-智屏-乐华品牌」，只有 AB 不同。
+# 运行时还会按标签内容在 AA:AC 范围内定位：唯一命中就用命中行（行号整体
+# 移动也能对上）；多行命中且本配置行在其中则沿用配置行并告警；否则中止。
+# 换账号后可先跑只读核对：python cli.py nav-scan --unit 乐华·电视
+#   - unit.nav_expect：该单元所有导航行都要包含的关键字（品牌，如 [乐华]）；
+#   - step.nav_expect：给某一步追加（可含 AB 关键字，如 [乐华, 智屏, 编制毛利之下费用]）；
+#   - step.after_close_nav_expect / unit.verify_nav_expect：运行包行/核对行专用。
+#
+# 可选（单元级）：
+#   - 跳过步骤: [HQ毛上调整] —— 该单元流程里没有的步骤整步移除（连同该步的
+#     after_save 计算宏 / after_close 运行包）；关键字须唯一命中一个流程步骤。
+#   - 表单覆盖: { 表单ID: { 跳过度量: [加权CT] } } —— 该单元这张表不编制的度量块，
+#     writer 表头识别、写入与 CSV 列校验都不再要求它（如 TCL商用 不编制 CT 成本）。
 
 品牌: [TCL, 雷鸟, 乐华]
 品类: [电视, 空调, 冰箱, 洗衣机, TCL商用]
@@ -15,14 +34,58 @@ units:
     启用: true
     品牌: 乐华
     品类: 电视
-    # 损益核对导航单元格（缺省沿用 flow.yaml 的 verify.nav_cell）
+    # 所有导航行都必须包含的关键字（品牌身份）。
+    # 现场实测 AA / AB / AC：
+    #  55 收入 / CBG总部编制价格&销量&开单扣率 / CBG-智屏-价格&销量-乐华
+    #  57 收入 / CBG总部编制客户费用流程 / CBG-乐华客户费用-乐华
+    #  59 收入 / 除泛智屏HQ渠道毛上调整 / CBG_乐华品牌-HQ渠道毛上调整
+    #  62 收入 / 毛利（CT）之上查询_CBG_查询流程 / 毛利之上查询-CBG-乐华
+    #  63 成本 / 编制其他成本 / CBG-其他成本编制-智屏-乐华
+    #  65 变动费用 / 编制毛利之下费用 / CBG-智屏-乐华品牌
+    #  67 变动费用 / 查询毛利之下费用 / CBG-智屏-乐华品牌  ← AC 同 65，靠 AB 区分
+    #  70 损益 / CBG损益查询流程 / CBG-乐华
+    nav_expect: [乐华]
+    # 损益核对导航行：必须同时命中 AB 的「CBG损益查询流程」，避免落到别的乐华行
+    verify_nav_expect: [乐华, CBG损益查询流程]
     verify_nav_cell: AC70
     steps:
-      - { 表单: 价格销量CT,  nav_cell: AC55 }
-      - { 表单: 客户费用,    nav_cell: AC57 }
-      - { 表单: HQ毛上调整,  nav_cell: AC59, after_close_nav_cell: AC62 }
-      - { 表单: 其他成本,    nav_cell: AC63 }
-      - { 表单: 费用及损益,  nav_cell: AC65, after_close_nav_cell: AC70 }
+      - { 表单: 价格销量CT,  nav_cell: AC55, nav_expect: [乐华, 智屏, 编制价格] }
+      - { 表单: 客户费用,    nav_cell: AC57, nav_expect: [乐华, 客户费用] }
+      # AC62 的「之上查询」不能省：AC67 的 AB 是「查询毛利之下费用」，只写
+      # [乐华, 毛利, 查询] 会同时命中 62/67 两行，失去按内容唯一定位的能力
+      - { 表单: HQ毛上调整,  nav_cell: AC59, nav_expect: [乐华, 毛上调整], after_close_nav_cell: AC62, after_close_nav_expect: [乐华, 毛利, 之上查询] }
+      - { 表单: 其他成本,    nav_cell: AC63, nav_expect: [乐华, 智屏, 编制其他成本] }
+      - { 表单: 费用及损益,  nav_cell: AC65, nav_expect: [乐华, 智屏, 编制毛利之下费用], after_close_nav_cell: AC70, after_close_nav_expect: [乐华, CBG损益查询流程] }
+
+  TCL·TCL商用:
+    启用: true
+    品牌: TCL
+    品类: TCL商用
+    # 与乐华·电视 的两点业务差异（业务确认 2026-11-25）：
+    #   1. 价格&销量&加权CT 表不编制 CT 成本（加权CT 度量块）→ 表单覆盖 跳过度量；
+    #   2. 没有 HQ渠道毛上调整 表 → 跳过步骤。
+    # 现场实测（11月财总版）导航行 AA / AB / AC：
+    #  56 收入 / CBG总部编制价格&销量&开单扣率 / CBG-商用-价格&销量
+    #  58 收入 / CBG总部编制客户费用流程 / CBG-TCL商用客户费用-TCL
+    #  64 成本 / 编制其他成本 / CBG-其他成本编制-商用
+    #  66 变动费用 / 编制毛利之下费用 / CBG-商用品类
+    #  69 损益 / CBG损益查询流程 / CBG-商用
+    nav_expect: [商用]
+    verify_nav_expect: [商用, CBG损益查询流程]
+    verify_nav_cell: AC69
+    verify_form_row: 54
+    # HQ 步骤连同它的 after_close 运行包（滚动预测收入计算/计算到销售组织的成本）
+    # 一起跳过；商用的收入计算由价格销量CT 表保存后的 Execute_PS 宏完成。
+    跳过步骤: [HQ毛上调整]
+    表单覆盖:
+      E61_CBG_价格销量CT编制:
+        跳过度量: [加权CT]
+    steps:
+      - { 表单: 价格销量CT,  nav_cell: AC56, nav_expect: [商用, CBG总部编制价格] }
+      - { 表单: 客户费用,    nav_cell: AC58, nav_expect: [TCL商用, 客户费用] }
+      - { 表单: 其他成本,    nav_cell: AC64, nav_expect: [商用, 编制其他成本] }
+      # after_close 继承 flow.yaml 的 packages（52: PS_计算损益_滚动预测）
+      - { 表单: 费用及损益,  nav_cell: AC66, nav_expect: [商用品类, 编制毛利之下费用], after_close_nav_cell: AC69, after_close_nav_expect: [商用, CBG损益查询流程] }
 
   # ---------- 以下为后续扩展预留（启用后需现场确认 nav_cell） ----------
   TCL·电视:    { 启用: false, 品牌: TCL, 品类: 电视 }
@@ -30,4 +93,3 @@ units:
   TCL·空调:    { 启用: false, 品牌: TCL, 品类: 空调 }
   TCL·冰箱:    { 启用: false, 品牌: TCL, 品类: 冰箱 }
   TCL·洗衣机:  { 启用: false, 品牌: TCL, 品类: 洗衣机 }
-  TCL·TCL商用: { 启用: false, 品牌: TCL, 品类: TCL商用 }

@@ -229,6 +229,7 @@ $("btn-upload").addEventListener("click", async () => {
   const fd = new FormData();
   fd.append("file", file);
   fd.append("period", period);
+  fd.append("unit", $("unit").value || "");   // 目录名带业务单元，各单元互不覆盖
 
   $("btn-upload").disabled = true;
   $("upload-result").innerHTML = '<div class="note">正在导出…</div>';

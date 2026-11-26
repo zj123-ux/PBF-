@@ -28,7 +28,9 @@ import yaml
 from flask import Flask, jsonify, render_template, request
 
 from paths import app_root
-from data_dirs import latest_data_dir as find_latest_data_dir
+from data_dirs import (data_dir_name as build_data_dir_name,
+                       latest_data_dir as find_latest_data_dir,
+                       latest_data_dir_for as find_latest_data_dir_for)
 from engine.business_units import (UnitError, check_units,
                                    csv_dimension_warnings, default_unit, get_unit)
 from engine.config_check import check_flow, check_form_config
@@ -119,9 +121,19 @@ def _resolve_unit(raw) -> tuple[str, str | None]:
     return name, None
 
 
-def latest_data_dir() -> str:
-    """最新上传数据目录名（按期间排序，排除 *_clear）；没有返回空串。"""
-    latest = find_latest_data_dir(APP_ROOT)
+def _configured_unit_names() -> list[str]:
+    """配置里的业务单元名（含未启用），用于识别 data_*_<单元> 目录后缀。"""
+    return list((load_business_units().get("units") or {}).keys())
+
+
+def latest_data_dir(unit: str = "") -> str:
+    """最新上传数据目录名（按期间排序，排除 *_clear）；没有返回空串。
+
+    指定 unit 时只看该单元的专用目录（没有则返回空串，不回退旧目录）。
+    """
+    names = _configured_unit_names()
+    latest = (find_latest_data_dir_for(APP_ROOT, unit, names) if unit
+              else find_latest_data_dir(APP_ROOT, names))
     return latest.name if latest else ""
 
 
@@ -137,10 +149,12 @@ def suggested_period() -> str:
     return f"{y}.{mo + 1:02d}"
 
 
-def _data_dir_name(periods: list[str]) -> str:
-    """导出/运行目录名：单期间 data_YYYY.MM，多期间 data_<首>_<末>。"""
-    first, last = periods[0], periods[-1]
-    return f"data_{first}" if first == last else f"data_{first}_{last}"
+def _data_dir_name(periods: list[str], unit: str = "") -> str:
+    """导出/运行目录名：data_<首>[_<末>][_<业务单元>]。
+
+    带单元名后，乐华与 TCL商用 同一期间各用各的目录，上传互不覆盖。
+    """
+    return build_data_dir_name(periods, unit)
 
 
 def _parse_period_spec(spec: str) -> list[str]:
@@ -678,16 +692,17 @@ def _count_csv_rows(data_dir: Path) -> tuple[int, int]:
     return files, rows
 
 
-def _check_template(flow_cfg: dict, form_cfgs: dict[str, dict], period: str) -> dict:
+def _check_template(flow_cfg: dict, form_cfgs: dict[str, dict], period: str,
+                    unit: str = "") -> dict:
     try:
         periods = parse_periods(period) if period else []
     except ValueError as exc:
         return _check("error", "模板数据", f"期间格式错误：{exc}")
     if periods:
-        data_dir: Path | None = APP_ROOT / _data_dir_name(periods)
-        name = _data_dir_name(periods)
+        name = _data_dir_name(periods, unit)
+        data_dir: Path | None = APP_ROOT / name
     else:
-        latest = latest_data_dir()
+        latest = latest_data_dir(unit)
         data_dir = APP_ROOT / latest if latest else None
         name = latest
     if data_dir is None or not data_dir.exists():
@@ -719,7 +734,7 @@ def check_env(unit: str = "", period: str = "") -> dict:
         _check_credentials(),
         _check_units_env(flow_cfg, unit),
         _check_flow_config(flow_cfg, form_cfgs),
-        _check_template(flow_cfg, form_cfgs, period),
+        _check_template(flow_cfg, form_cfgs, period, unit),
     ]
     return {"checks": checks}
 
@@ -790,13 +805,17 @@ def api_upload():
     suffix = Path(file.filename).suffix.lower()
     if suffix not in (".xlsx", ".xlsm"):
         return jsonify({"ok": False, "error": f"仅支持 .xlsx / .xlsm，实际为 {suffix}"}), 400
+    # 目录名带业务单元：乐华 / TCL商用 同期间上传互不覆盖
+    unit, unit_error = _resolve_unit(request.form.get("unit"))
+    if unit_error:
+        return jsonify({"ok": False, "error": unit_error}), 400
 
     tmp = WEB_RUN_DIR / f"upload_{uuid.uuid4().hex[:8]}{suffix}"
     WEB_RUN_DIR.mkdir(parents=True, exist_ok=True)
     file.save(str(tmp))
     try:
         from engine.template_export import EmptyExportError, export_template
-        out_dir = APP_ROOT / _data_dir_name(periods)
+        out_dir = APP_ROOT / _data_dir_name(periods, unit)
         # min_rows=1：0 行模板在替换目录之前就报错，不破坏上一份正确数据
         rows = export_template(tmp, periods, out_dir, min_rows=1)
     except EmptyExportError as exc:
@@ -811,7 +830,7 @@ def api_upload():
 
     total = sum(rows.values())
     return jsonify({"ok": True, "rows": rows, "total": total, "data_dir": out_dir.name,
-                    "periods": periods,
+                    "unit": unit, "periods": periods,
                     "warnings": csv_dimension_warnings(out_dir)})
 
 
@@ -826,7 +845,7 @@ def api_run():
     unit, unit_error = _resolve_unit(data.get("unit"))
     if unit_error:
         return jsonify({"ok": False, "error": unit_error}), 400
-    data_dir = APP_ROOT / _data_dir_name(periods)
+    data_dir = APP_ROOT / _data_dir_name(periods, unit)
     if not data_dir.exists():
         return jsonify({"ok": False, "error": f"数据目录不存在: {data_dir.name}，请先上传模板导出"}), 400
     run_id = _spawn({

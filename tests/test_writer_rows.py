@@ -368,6 +368,48 @@ class WriterNewRowTests(unittest.TestCase):
         self.assertEqual(pf.key_updates, {})
         self.assertIn("无空白行", " ".join(pf.skipped))
 
+    def test_append_rows_on_empty_table_starts_at_first_input_row(self) -> None:
+        # TCL商用客户费用：整张表一条数据行都没有，没有锚点行，
+        # 从表头下方首个可写行（input_rows 首行）开始新增
+        engine = FakeEngine()
+        writer = FormWriter(engine, {**KEYED_CFG, "input_rows": [57, 60],
+                                     "append_rows": True})
+        pf = writer.preflight([{"组织": "A", "科目": "X", "2027.01": 5}])
+        self.assertTrue(pf.ok, pf.checks)
+        self.assertEqual(pf.key_updates, {"AA57": "A", "AB57": "X"})
+        self.assertEqual([r["cell"] for r in pf.matched_rows], ["AI57"])
+        self.assertEqual([n["row"] for n in pf.new_rows], [57])
+
+    def test_append_rows_allocates_consecutive_rows_for_multiple_keys(self) -> None:
+        # 多条匹配不上的数据各自占一行，连续追加
+        engine = FakeEngine()
+        writer = FormWriter(engine, {**KEYED_CFG, "input_rows": [57, 60],
+                                     "append_rows": True})
+        pf = writer.preflight([
+            {"组织": "A", "科目": "X", "2027.01": 5},
+            {"组织": "B", "科目": "Y", "2027.01": 6},
+        ])
+        self.assertTrue(pf.ok, pf.checks)
+        self.assertEqual(pf.key_updates, {"AA57": "A", "AB57": "X",
+                                          "AA58": "B", "AB58": "Y"})
+        self.assertEqual({r["cell"] for r in pf.matched_rows}, {"AI57", "AI58"})
+        self.assertEqual([n["row"] for n in pf.new_rows], [57, 58])
+
+    def test_append_rows_stops_at_parameter_row(self) -> None:
+        # 客户费用表 66-68 是 PBF 宏参数行，追加到参数行之前必须停止，
+        # 后面的新键宁可跳过也不能跨过参数行写
+        engine = FakeEngine()
+        writer = FormWriter(engine, {**KEYED_CFG, "input_rows": [57, 60],
+                                     "skip_rows": [58, 59, 60],
+                                     "append_rows": True})
+        pf = writer.preflight([
+            {"组织": "A", "科目": "X", "2027.01": 5},
+            {"组织": "B", "科目": "Y", "2027.01": 6},
+        ])
+        self.assertFalse(pf.ok)
+        self.assertEqual(pf.key_updates, {"AA57": "A", "AB57": "X"})
+        self.assertIn("无空白行", " ".join(pf.skipped))
+
 
 class MeasureBlockHeaderTests(unittest.TestCase):
     """价格&销量表的度量块宽度随版本变化：必须按表头动态识别列。"""

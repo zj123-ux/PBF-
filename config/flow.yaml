@@ -54,6 +54,12 @@ navigator:
   version_cell: "AR45"                 # 版本显示，如"滚动预测2026年11月月初版"
   refresh_flow_macro: "Refresh_Status"  # "刷新流程"按钮 Button 9
   open_button_cell: "AT52"             # 选中业务单元行后，AT52 变为"打开"
+  # 按 AA(业务模块)+AB(流程步骤)+AC(业务单元) 标签内容定位导航行：
+  # 唯一命中 → 用命中行（换账号后行号整体移动也能正确打开）；
+  # 多行命中且配置行在其中 → 沿用配置行并告警；否则中止（零副作用）。
+  # 导航表按账号权限生成，固定行号只作为兜底与配置参考。
+  locate_by_label: true
+  locate_scan_range: "AA1:AC200"       # 只读扫描范围（大于实际使用区域无妨）
   open_wait_sec: 14
   # 右侧「步骤事项」面板（AP=名称 AQ=ID AR=类型 AS=说明 AT=执行/打开）。
   # 选中业务单元后面板必须刷新；不刷新说明 AO 会话已失效，不能直接点 AT52。

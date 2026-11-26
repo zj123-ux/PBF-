@@ -9,8 +9,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _stubs  # noqa: F401  （确保仓库根在 sys.path）
 
-from data_dirs import (data_dir_periods, data_dir_target_period, is_data_dir,
-                       latest_data_dir, list_data_dirs, unrecognized_data_dirs)
+from data_dirs import (data_dir_name, data_dir_periods, data_dir_target_period,
+                       data_dir_unit, is_data_dir, latest_data_dir,
+                       latest_data_dir_for, list_data_dirs,
+                       unrecognized_data_dirs)
 
 
 class DataDirTests(unittest.TestCase):
@@ -76,6 +78,40 @@ class DataDirTests(unittest.TestCase):
                     "data_tmp", "data_2027.01_2027.04_clear", "notes")
         names = [p.name for p in unrecognized_data_dirs(self.root)]
         self.assertEqual(names, ["data_2027.01_bak", "data_2027.1", "data_tmp"])
+
+    def test_unit_suffix_naming_and_parsing(self) -> None:
+        units = ["TCL·TCL商用", "乐华·电视"]
+        self.assertEqual(data_dir_name(["2026.11", "2026.12"], "TCL·TCL商用"),
+                         "data_2026.11_2026.12_TCL·TCL商用")
+        self.assertEqual(data_dir_name(["2026.11"], "乐华·电视"),
+                         "data_2026.11_乐华·电视")
+        self.assertEqual(data_dir_name(["2026.11", "2026.12"]),
+                         "data_2026.11_2026.12")
+        self.assertEqual(data_dir_unit("data_2026.11_2026.12_乐华·电视"), "乐华·电视")
+        self.assertIsNone(data_dir_unit("data_2026.11_2026.12"))
+        self.assertEqual(data_dir_periods("data_2026.11_2026.12_乐华·电视", units),
+                         ["2026.11", "2026.12"])
+        # 未给单元清单时带后缀目录不参与数据源（data_2027.01_bak 类备份防御）
+        self.assertEqual(data_dir_periods("data_2026.11_2026.12_乐华·电视"), [])
+        self.assertEqual(data_dir_periods("data_2026.11_bak", units), [])
+
+    def test_unit_dirs_are_data_dirs_only_with_known_units(self) -> None:
+        units = ["TCL·TCL商用", "乐华·电视"]
+        self._mkdir("data_2026.11_2026.12_TCL·TCL商用",
+                    "data_2026.11_2026.12_乐华·电视",
+                    "data_2026.12")
+        self.assertTrue(is_data_dir(self.root / "data_2026.11_2026.12_乐华·电视", units))
+        self.assertFalse(is_data_dir(self.root / "data_2026.11_2026.12_乐华·电视"))
+        names = [p.name for p in list_data_dirs(self.root, units)]
+        self.assertIn("data_2026.12", names)      # 旧版无后缀目录仍兼容
+        self.assertEqual(len(names), 3)
+        self.assertEqual(latest_data_dir_for(self.root, "TCL·TCL商用", units).name,
+                         "data_2026.11_2026.12_TCL·TCL商用")
+        self.assertIsNone(latest_data_dir_for(self.root, "雷鸟·电视", units))
+        # 未传 units 时带后缀目录列在“未识别”里，不会被误当数据源
+        self.assertEqual([p.name for p in unrecognized_data_dirs(self.root)],
+                         ["data_2026.11_2026.12_TCL·TCL商用",
+                          "data_2026.11_2026.12_乐华·电视"])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 # CBG 客户费用编制表 — E61 品类
 # 结构: keyed — (渠道 + 科目) 组合键 × 期间矩阵
 # 2026-11-11 live 扫描确认: header_row=56, AA=渠道, AB=科目, 期间 AC..AR
+# 2026-11-25 live 复核: 期间 AC..AS（2026.01-2027.05）, 数据行 57-256（默认 200 行）
 form_id: E61_CBG_客户费用编制
 label: "客户费用"
 workbook_pattern: "YCSRW017_客户费用编制表_CBG专用*"
@@ -25,8 +26,14 @@ version_match_cell: "H4"       # Y=目标与当前一致
 key_columns:
   - { column: AA, name: 渠道 }
   - { column: AB, name: 科目 }
-input_rows: [57, 65]           # 66-68 是 PBF 宏参数行
-skip_rows: [66, 67, 68]
+# 数据区 57-256（默认 200 行）。A-I 列的宏参数块（66 行起）不在数据列上，
+# 不影响 AA/AB 空白判断，不能当 skip_rows。
+input_rows: [57, 256]
+skip_rows: []
+# 匹配不到的行（含整张表为空，如 TCL商用）在表尾新增：先写 AA 渠道 / AB 科目，
+# 再写各期间金额。空白表从 57 行起追加。
+allow_new_rows: true
+append_rows: true
 
 # 期间列 — 全期间 (2026.01 ~ 2027.04)，2027.01 = AO（录制写入位）
 month_columns:
@@ -46,6 +53,7 @@ month_columns:
   "2027.02": AP
   "2027.03": AQ
   "2027.04": AR
+  "2027.05": AS
 
 macros:
   save: "Plan_Save"

@@ -1,6 +1,7 @@
 # 费用及损益其他项编制查询表 — 非海外
 # 结构: keyed — (组织+科目+产品+区域+渠道+品牌) 组合键 × 期间矩阵
-# 2026-11-11 live 扫描确认: header_row=56, 数据 57..312(动态), 期间 AG..AL
+# 2026-11-11 live 扫描确认: header_row=56, 期间 AG..AL
+# 2026-11-25 用户确认: 数据区默认 200 行（57-256）
 form_id: 费用及损益其他项编制_非海外
 label: "变动费用（费用及损益其他项）"
 workbook_pattern: "YC_费用及损益其他项编制查询表_非海外*"
@@ -28,7 +29,7 @@ key_columns:
   - { column: AD, name: 区域 }
   - { column: AE, name: 渠道 }
   - { column: AF, name: 品牌 }
-input_rows: [57, 312]          # 行数随数据变化，实际以 key 匹配为准
+input_rows: [57, 256]          # 数据区默认 200 行；实际以 key 匹配为准
 skip_rows: []
 
 # 期间列 — 2027.01 = AI（录制写入位）

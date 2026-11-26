@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 import sys
 import time
 import unittest
@@ -65,10 +66,29 @@ class FakeSheet:
         self.version = "滚动预测2026年11月财总版"
         self.selection_log: list[str] = []
         self.btn = "AT52"
+        # 导航表 Worksheet_SelectionChange 在处理选中行时会写 B4（本次选择行数），
+        # 写在 AO 调用之前；handler_runs=False 模拟选中未触发 VBA（会话/窗口异常）。
+        self.b4 = None
+        self.handler_runs = True
         # 真实 AO 打开的工作簿名带时间戳（…(17-55-41).xlsb），每次都不一样；
         # 若这里重复追加同名，"新增工作簿"按集合差集判断会永远为空。
         self.open_count = 0
         self.clicks_blocked = False
+        # AA(业务模块) / AB(流程步骤) / AC(业务单元) 三列标签（现场实测原文）
+        self.labels: dict[str, str] = {
+            "AA55": "收入", "AB55": "CBG总部编制价格&销量&开单扣率",
+            "AC55": "CBG-智屏-价格&销量-乐华",
+            "AA57": "收入", "AB57": "CBG总部编制客户费用流程",
+            "AC57": "CBG-乐华客户费用-乐华",
+            "AA62": "收入", "AB62": "毛利（CT）之上查询_CBG_查询流程",
+            "AC62": "毛利之上查询-CBG-乐华",
+            "AA65": "变动费用", "AB65": "编制毛利之下费用",
+            "AC65": "CBG-智屏-乐华品牌",
+            "AA67": "变动费用", "AB67": "查询毛利之下费用",
+            "AC67": "CBG-智屏-乐华品牌",
+            "AA70": "损益", "AB70": "CBG损益查询流程",
+            "AC70": "CBG-乐华",
+        }
 
     # COM 形状
     def Activate(self) -> None:     # noqa: N802
@@ -82,7 +102,10 @@ class FakeSheet:
         self.selection_log.append(addr)
         if addr == "A1":
             return
+        if not self.handler_runs:
+            return
         if addr in self.panels:
+            self.b4 = int(addr[2:])
             if self.refresh_on_select:
                 self.panel = {r: list(v) for r, v in self.panels[addr].items()}
             return
@@ -97,8 +120,20 @@ class FakeSheet:
             return tuple(
                 tuple(self.panel.get(r, [None] * 6)[:6]) for r in range(48, 61)
             )
+        m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", addr)
+        if m:
+            # 批量扫描 AA:AC：返回二维 tuple（未配置的格子为 None），
+            # 与 Excel Range.Value2 形状一致
+            c1, r1, c2, r2 = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+            cols = [c1] if c1 == c2 else ["AA", "AB", "AC"]
+            return tuple(
+                tuple(self.value(f"{col}{r}") for col in cols)
+                for r in range(r1, r2 + 1)
+            )
         if addr == "AR45":
             return self.version
+        if addr == "B4":
+            return self.b4
         if addr.startswith("AT"):
             r = int(addr[2:])
             row = self.panel.get(r)
@@ -111,6 +146,8 @@ class FakeSheet:
             r = int(addr[2:])
             row = self.panel.get(r)
             return row[0] if row else None
+        if addr in self.labels:
+            return self.labels[addr]
         return None
 
 
@@ -168,7 +205,7 @@ class FakeEngine:
         return None
 
 
-def make_flow(refresh_on_select: bool = True):
+def make_flow(refresh_on_select: bool = True, unit_expect=None, user_key=None):
     panels = {
         "AC62": {
             52: ["PS_经营模型_收入_预测_滚动预测收入计算", "ZPS_1", "运行包", "收入计算", "打开"],
@@ -214,7 +251,12 @@ def make_flow(refresh_on_select: bool = True):
         },
         "verify_writeback": {},
     }
-    flow = PbfFlow(engine, cfg, {}, Path("data_2027.02_clear"))
+    if unit_expect is not None:
+        cfg["_unit"] = {
+            "name": "乐华·电视", "brand": "乐华", "category": "电视",
+            "nav_expect": list(unit_expect),
+        }
+    flow = PbfFlow(engine, cfg, {}, Path("data_2027.02_clear"), user_key=user_key)
     return flow, engine, sheet
 
 
@@ -304,6 +346,28 @@ class PanelCacheTests(unittest.TestCase):
         # 静止面板被采用后也应落库，下次可直接命中缓存
         self.assertIn(flow._panel_cache_key("AC62"), flow._panel_cache)
 
+    def test_static_panel_accepted_for_any_expect_when_b4_matches(self) -> None:
+        """两行共用同一流程模板（商用/乐华均为 CBG损益查询流程）时面板内容相同。
+
+        expect="any"（损益核对）没有期望行类型，原逻辑永远不接受静止面板，
+        会把"面板内容本来就一样"误报成会话失效。B4 记录本次选中行 == 目标行
+        时按真实行类型接受。
+        """
+        flow, _, sheet = make_flow(refresh_on_select=False)
+        sheet.panel = {r: list(v) for r, v in sheet.panels["AC70"].items()}
+        name = flow.open_via_nav("AC70", open_cell="AT52", expect="any")
+        self.assertIn("运行包", name)
+        self.assertIn(flow._panel_cache_key("AC70"), flow._panel_cache)
+
+    def test_static_panel_rejected_when_b4_points_to_another_row(self) -> None:
+        """面板没变化且 B4 不是目标行：选中未生效/会话异常，不能静态放行。"""
+        flow, _, sheet = make_flow(refresh_on_select=False)
+        sheet.panel = {r: list(v) for r, v in sheet.panels["AC70"].items()}
+        sheet.handler_runs = False     # 选中没有触发导航表 VBA，B4 停在旧行
+        sheet.b4 = 52
+        with self.assertRaises(SessionExpiredError):
+            flow.open_via_nav("AC70", open_cell="AT52", expect="any")
+
     def test_stale_static_panel_with_wrong_row_type_still_rejected(self) -> None:
         """静止面板若停在别的行上，行类型对不上仍要拦下，不能被静态放行绕过。"""
         flow, _, sheet = make_flow(refresh_on_select=False)
@@ -350,6 +414,126 @@ class PanelCacheTests(unittest.TestCase):
             flow2._panel_cache_file = cache_file
             flow2._load_panel_cache()
             self.assertEqual(flow2._panel_cache.get(key), data[key])
+
+
+class NavLabelGuardTests(unittest.TestCase):
+    """换账号后导航表按权限重新生成，行号可能整体移动。
+
+    固定 nav_cell 一旦指到别的业务单元，仅凭行类型/工作簿名无法识别
+    （同名表单的工作簿 pattern 相同）。因此选中前必须核对 AC 列标签，
+    不匹配时零副作用中止（不点 A1、不触发 SelectionChange）。
+    """
+
+    def test_wrong_label_aborts_without_selecting(self):
+        flow, engine, sheet = make_flow(unit_expect=["乐华"])
+        sheet.labels["AC55"] = "CBG-智屏-价格&销量-TCL"
+        with self.assertRaises(ExcelError) as ctx:
+            flow.open_via_nav("AC55", expect="form")
+        self.assertIn("标签", str(ctx.exception))
+        self.assertIn("乐华", str(ctx.exception))
+        self.assertEqual(sheet.selection_log, [])
+        self.assertEqual(engine.names, ["PBF Pro - 全面预算系统流程导航.xlsb"])
+
+    def test_correct_label_passes(self):
+        flow, _, sheet = make_flow(unit_expect=["乐华", "智屏"])
+        name = flow.open_via_nav("AC55", expect="form")
+        self.assertIn("运行包", name)
+        self.assertEqual(sheet.selection_log[:2], ["A1", "AC55"])
+
+    def test_empty_label_rejected(self):
+        flow, _, sheet = make_flow(unit_expect=["乐华"])
+        sheet.labels["AC55"] = ""
+        with self.assertRaisesRegex(ExcelError, "标签"):
+            flow.open_via_nav("AC55", expect="form")
+        self.assertEqual(sheet.selection_log, [])
+
+    def test_step_level_expect_overrides_unit_default(self):
+        flow, _, sheet = make_flow(unit_expect=["乐华"])
+        # 单元级只有「乐华」能过；步骤级追加「智屏」，AC57 标签不含 → 拦截
+        with self.assertRaisesRegex(ExcelError, "智屏"):
+            flow.open_via_nav("AC57", expect="form",
+                              expect_labels=["乐华", "智屏"])
+        self.assertEqual(sheet.selection_log, [])
+
+    def test_after_close_uses_unit_level_default(self):
+        flow, _, _ = make_flow(unit_expect=["乐华"])
+        # AC62 标签不含「智屏」，after_close 走单元级关键字，不应被步骤级规则误伤
+        name = flow.open_via_nav("AC62", expect="package")
+        self.assertIn("运行包", name)
+
+    def test_ab_label_distinguishes_same_ac(self):
+        """AC65/AC67 的 AC 都是「CBG-智屏-乐华品牌」，只能靠 AB 的编制/查询区分。"""
+        flow, _, sheet = make_flow(unit_expect=["乐华"])
+        expect = ["乐华", "编制毛利之下费用"]
+        flow._check_nav_label(sheet, "AC65", expect)          # 编制行通过
+        with self.assertRaisesRegex(ExcelError, "编制毛利之下费用"):
+            flow._check_nav_label(sheet, "AC67", expect)      # 查询行被拦
+
+    def test_verify_ab_keyword_used(self):
+        """核对行 AC70 需同时命中 AB 的「CBG损益查询流程」。"""
+        flow, _, sheet = make_flow(unit_expect=["乐华"])
+        flow._check_nav_label(sheet, "AC70", ["乐华", "CBG损益查询流程"])
+        with self.assertRaisesRegex(ExcelError, "CBG损益查询流程"):
+            flow._check_nav_label(sheet, "AC62", ["乐华", "CBG损益查询流程"])
+
+
+class NavLocateTests(unittest.TestCase):
+    """按 AA+AB+AC 内容定位（#4）：换账号行号整体移动时也能打开正确表单。"""
+
+    def test_unique_label_relocates_moved_row(self):
+        flow, engine, sheet = make_flow(unit_expect=["乐华"])
+        # 新账号权限不同：AC55 整行下移到 AC58，配置仍是 AC55
+        for col in ("AA", "AB", "AC"):
+            sheet.labels[f"{col}58"] = sheet.labels.pop(f"{col}55")
+        sheet.panels["AC58"] = sheet.panels["AC55"]
+
+        name = flow.open_via_nav(
+            "AC55", expect="form",
+            expect_labels=["乐华", "智屏", "编制价格"])
+        self.assertIn("运行包", name)
+        # 必须选中按内容找到的 AC58，而不是配置的 AC55
+        self.assertEqual(sheet.selection_log[:2], ["A1", "AC58"])
+
+    def test_unknown_label_aborts_without_selecting(self):
+        flow, engine, sheet = make_flow(unit_expect=["乐华"])
+        with self.assertRaises(ExcelError) as ctx:
+            flow.open_via_nav("AC55", expect="form",
+                              expect_labels=["乐华", "不存在的流程"])
+        self.assertIn("按标签定位失败", str(ctx.exception))
+        self.assertEqual(sheet.selection_log, [])
+        self.assertEqual(engine.names, ["PBF Pro - 全面预算系统流程导航.xlsb"])
+
+    def test_query_row_relocates_to_edit_row(self):
+        """配置写成 AC67（查询）但关键字是「编制毛利之下费用」：按内容定位到 AC65。"""
+        flow, _, sheet = make_flow(unit_expect=["乐华"])
+        cell = flow._resolve_nav_cell(
+            sheet, "AC67", ["乐华", "编制毛利之下费用"])
+        self.assertEqual(cell, "AC65")
+
+    def test_query_keywords_locate_query_row(self):
+        """反向：关键字「查询毛利之下费用」唯一命中 AC67，与配置行无关。"""
+        flow, _, sheet = make_flow(unit_expect=["乐华"])
+        cell = flow._resolve_nav_cell(
+            sheet, "AC65", ["乐华", "查询毛利之下费用"])
+        self.assertEqual(cell, "AC67")
+
+    def test_locate_disabled_uses_fixed_cell(self):
+        flow, _, sheet = make_flow(unit_expect=["乐华", "编制毛利之下费用"])
+        flow.nav_cfg["locate_by_label"] = False
+        name = flow.open_via_nav("AC65", expect="form")
+        self.assertIn("运行包", name)
+        self.assertEqual(sheet.selection_log[:2], ["A1", "AC65"])
+
+
+class PanelCacheAccountTests(unittest.TestCase):
+    def test_cache_key_separated_by_account(self):
+        a, _, _ = make_flow(user_key="alice")
+        a2, _, _ = make_flow(user_key="alice")
+        b, _, _ = make_flow(user_key="bob")
+        ka = a._panel_cache_key("AC62")
+        self.assertNotEqual(ka, b._panel_cache_key("AC62"))
+        self.assertEqual(ka, a2._panel_cache_key("AC62"))
+        self.assertIn("alice", ka)
 
 
 class RunPackageTests(unittest.TestCase):
